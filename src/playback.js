@@ -1,4 +1,5 @@
 import { createWasmDecryptor } from "./wasm-decrypt.js";
+import { pipeQuery } from "./deezer.js";
 
 // Authenticated Deezer media resolution and streaming support.
 // Kept separate from catalog routes so ordinary search never resolves audio.
@@ -11,7 +12,7 @@ const BROWSER_HEADERS = {
   "Referer": "https://www.deezer.com/",
 };
 const sessionCache = new Map();
-const tokenCache = new Map();
+const pipePlaybackCache = new Map();
 const reportDedupe = new Map();
 
 function asJsonResponse(response) { return response.json().catch(() => null); }
@@ -74,7 +75,7 @@ async function gatewayCall(method, params, session) {
   return payload;
 }
 
-async function getSession(env) {
+async function getGatewaySession(env) {
   const arl = String(env?.DEEZER_ARL || "").trim();
   if (!arl) throw errorWithStatus("Set DEEZER_ARL to enable authenticated full-track playback.", 503, "ARL_REQUIRED");
   const cached = sessionCache.get(arl);
@@ -131,21 +132,58 @@ async function getSession(env) {
   return session;
 }
 
-async function getTrackTokens(trackId, session) {
-  const key = `${session.arl}|${trackId}`;
-  const cached = tokenCache.get(key);
-  if (cached && cached.expiresAt > Date.now() && cached.data?.TRACK_TOKEN) return cached.data;
-  let data = null;
-  const result = await gatewayCall("song.getListData", { sng_ids: [Number(trackId)] }, session);
-  data = result?.results?.data?.[0] || null;
-  if (!data?.TRACK_TOKEN) {
-    const fallback = await gatewayCall("song.getData", { sng_id: Number(trackId), SNG_ID: Number(trackId) }, session);
-    data = fallback?.results || null;
+async function getPipeTrackData(trackId, env) {
+  const arl = String(env?.DEEZER_ARL || "").trim();
+  if (!arl) throw errorWithStatus("Set DEEZER_ARL to enable authenticated playback.", 503, "ARL_REQUIRED");
+  const key = `${arl}|${trackId}`;
+  const cached = pipePlaybackCache.get(key);
+  if (cached && cached.expiresAt > Date.now()) return cached.data;
+
+  const query = `query DeezerPlaybackData($trackId: String!) {
+    track(trackId: $trackId) {
+      id title duration
+      media {
+        id version
+        token { payload expiresAt }
+        estimatedSizes { MP3_128 MP3_320 FLAC }
+        rights { user { full { available } } sub { available } }
+      }
+    }
+    tokens { mediaServiceLicenseToken { token expirationDate } }
+    me { id }
+  }`;
+  let data;
+  try {
+    data = await pipeQuery(query, { trackId: String(trackId) }, env);
+  } catch (cause) {
+    throw errorWithStatus(`Deezer Pipe GraphQL playback lookup failed: ${String(cause?.message || "unknown Pipe error").slice(0, 180)}`, cause?.status || 502, "PIPE_PLAYBACK_LOOKUP_FAILED");
   }
-  if (data?.FALLBACK) data = { ...data, ...data.FALLBACK };
-  if (!data?.TRACK_TOKEN) throw errorWithStatus("Deezer did not return a playable full-track token for this track.", 404, "TRACK_TOKEN_MISSING");
-  tokenCache.set(key, { data, expiresAt: Date.now() + 30000 });
-  return data;
+
+  const track = data?.track;
+  const media = track?.media;
+  const trackToken = media?.token?.payload;
+  const licenseToken = data?.tokens?.mediaServiceLicenseToken?.token;
+  if (!track || !media || typeof trackToken !== "string" || !trackToken || typeof licenseToken !== "string" || !licenseToken) {
+    throw errorWithStatus("Pipe GraphQL did not return a media token and media-service license token for this track.", 502, "PIPE_PLAYBACK_TOKENS_MISSING");
+  }
+  if (media?.rights?.user?.full?.available === false && media?.rights?.sub?.available === false) {
+    throw errorWithStatus("Pipe GraphQL reports that full playback is not available for this account and track.", 403, "TRACK_NOT_ENTITLED");
+  }
+  const sizes = media.estimatedSizes || {};
+  const result = {
+    trackId: String(track.id ?? trackId),
+    title: String(track.title || ""),
+    duration: Number(track.duration || 0),
+    trackToken,
+    licenseToken,
+    canLossless: Number(sizes.FLAC || 0) > 0,
+    can320: Number(sizes.MP3_320 || 0) > 0,
+    can128: Number(sizes.MP3_128 || 0) > 0,
+    mediaTokenExpiresAt: media.token.expiresAt || null,
+    licenseTokenExpiresAt: data?.tokens?.mediaServiceLicenseToken?.expirationDate || null,
+  };
+  pipePlaybackCache.set(key, { data: result, expiresAt: Date.now() + 20000 });
+  return result;
 }
 
 function formatLadder(quality) {
@@ -173,21 +211,20 @@ function safeCdnUrl(raw) {
 }
 
 export async function resolveFullTrack(trackId, quality, env) {
-  const session = await getSession(env);
-  const trackData = await getTrackTokens(trackId, session);
+  const trackData = await getPipeTrackData(trackId, env);
   const ladder = formatLadder(quality);
   if (!ladder.length) throw errorWithStatus("Preview quality does not use the full-track resolver.", 400, "PREVIEW_REQUESTED");
   const attempts = [];
 
   for (const targetFormat of ladder) {
-    if (targetFormat === "FLAC" && session.canLossless === false) { attempts.push(`${targetFormat}: account option unavailable`); continue; }
-    if (targetFormat === "MP3_320" && session.can320 === false) { attempts.push(`${targetFormat}: account option unavailable`); continue; }
-    if (targetFormat === "FLAC" && String(trackData.FILESIZE_FLAC || "") === "0") { attempts.push(`${targetFormat}: track has no FLAC asset`); continue; }
+    if (targetFormat === "FLAC" && !trackData.canLossless) { attempts.push(`${targetFormat}: Pipe reports no FLAC asset/entitlement`); continue; }
+    if (targetFormat === "MP3_320" && !trackData.can320) { attempts.push(`${targetFormat}: Pipe reports no 320 kbps asset/entitlement`); continue; }
+    if (targetFormat === "MP3_128" && !trackData.can128) { attempts.push(`${targetFormat}: Pipe reports no 128 kbps asset/entitlement`); continue; }
     let response;
     try {
       response = await fetch(DEEZER_MEDIA_API, {
         method: "POST", headers: { ...BROWSER_HEADERS, "Content-Type": "application/json" },
-        body: JSON.stringify({ license_token: session.licenseToken, media: [{ type: "FULL", formats: [{ cipher: "BF_CBC_STRIPE", format: targetFormat }] }], track_tokens: [trackData.TRACK_TOKEN] }),
+        body: JSON.stringify({ license_token: trackData.licenseToken, media: [{ type: "FULL", formats: [{ cipher: "BF_CBC_STRIPE", format: targetFormat }] }], track_tokens: [trackData.trackToken] }),
         signal: AbortSignal.timeout(15000), cache: "no-store",
       });
     } catch (cause) {
@@ -207,7 +244,7 @@ export async function resolveFullTrack(trackId, quality, env) {
         attempts.push(`${targetFormat}: unsupported response format`);
         continue;
       }
-      return { trackId: String(trackId), format: actualFormat, profile: profileFor(actualFormat), cdnUrl, duration: Number(trackData.DURATION || 0) };
+      return { trackId: String(trackId), format: actualFormat, profile: profileFor(actualFormat), cdnUrl, duration: Number(trackData.duration || 0) };
     }
     const rawCode = dataItem?.errors?.[0]?.code ?? result?.errors?.[0]?.code ?? result?.error?.code ?? "";
     const sanitizedCode = String(rawCode).replace(/[^A-Z0-9_-]/gi, "").slice(0, 36);
@@ -387,7 +424,7 @@ export async function reportListen({ trackId, playToken, event }, env) {
   for (const [key, expiry] of reportDedupe) if (expiry <= now) reportDedupe.delete(key);
   if (reportDedupe.has(dedupeKey)) return { accepted: true, duplicate: true, event: mark, playToken: updatedPlayToken };
 
-  const session = await getSession(env);
+  const session = await getGatewaySession(env);
   const timestamp = Math.floor(now / 1000);
   const startedAt = Number(claimsForEvent.startedAt || claimsForEvent.iat);
   // The observed gateway format is a batched method envelope. `log.listen`

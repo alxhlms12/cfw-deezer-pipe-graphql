@@ -9,6 +9,25 @@ globalThis.fetch = async (input, init = {}) => {
   const url = new URL(typeof input === "string" || input instanceof URL ? String(input) : input.url);
   calls.push({ url: url.toString(), init });
 
+  if (url.hostname === "auth.deezer.com" && url.pathname === "/login/arl") {
+    const payload = btoa(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 300, userId: "7" })).replace(/=/g, "");
+    return new Response(JSON.stringify({ jwt: `header.${payload}.signature` }), { headers: { "Content-Type": "text/plain" } });
+  }
+  if (url.hostname === "pipe.deezer.com" && url.pathname === "/api") {
+    const query = JSON.parse(init.body).query;
+    assert.match(query, /mediaServiceLicenseToken/);
+    assert.match(query, /token \{ payload expiresAt \}/);
+    return Response.json({ data: {
+      track: { id: "99", title: "Test Track", duration: 181, media: {
+        id: "media-99", version: "1", token: { payload: "route-track-token", expiresAt: "2099-01-01T00:00:00Z" },
+        estimatedSizes: { MP3_128: 4096, MP3_320: 4096, FLAC: 4096 },
+        rights: { user: { full: { available: true } }, sub: { available: true } }
+      } },
+      tokens: { mediaServiceLicenseToken: { token: "route-license-token", expirationDate: "2099-01-01T00:00:00Z" } },
+      me: { id: "7" }
+    } });
+  }
+
   if (url.hostname === "www.deezer.com" && url.pathname === "/ajax/gw-light.php") {
     const gatewayMethod = url.searchParams.get("method");
     if (gatewayMethod === "deezer.ping") return Response.json({ results: { SESSION: "route-session" } });
@@ -16,9 +35,6 @@ globalThis.fetch = async (input, init = {}) => {
       SESSION_ID: "route-session", checkForm: "route-api-token",
       USER: { USER_ID: 12, OPTIONS: { license_token: "route-license-token", web_lossless: true, web_hq: true } },
     } });
-    if (gatewayMethod === "song.getListData") return Response.json({ results: { data: [{
-      SNG_ID: 99, TRACK_TOKEN: "route-track-token", FILESIZE_FLAC: "4096",
-    }] } });
     if (gatewayMethod === null) {
       const batch = JSON.parse(init.body);
       if (batch?.[0]?.method === "log.listen") return Response.json([{ results: { success: true } }]);
@@ -62,6 +78,8 @@ assert.equal(attr.trackPresentation, "FULL");
 assert.equal(attr.format, "FLAC");
 assert.match(attr.uri, /playback=1/);
 assert.doesNotMatch(JSON.stringify(manifest), /route-test-arl|route-license-token|route-track-token/);
+assert.ok(calls.some(x => new URL(x.url).hostname === "pipe.deezer.com"), "expected Pipe GraphQL playback lookup");
+assert.ok(!calls.some(x => new URL(x.url).searchParams.get("method") === "song.getListData"), "legacy song.getListData must not be used");
 
 const playbackRes = await worker.fetch(new Request(attr.uri), env);
 assert.equal(playbackRes.status, 200, await playbackRes.clone().text());
