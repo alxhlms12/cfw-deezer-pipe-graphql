@@ -1,3 +1,5 @@
+import { createWasmDecryptor } from "./wasm-decrypt.js";
+
 // Authenticated Deezer media resolution and streaming support.
 // Kept separate from catalog routes so ordinary search never resolves audio.
 const DEEZER_GW = "https://www.deezer.com/ajax/gw-light.php";
@@ -10,7 +12,6 @@ const BROWSER_HEADERS = {
 };
 const sessionCache = new Map();
 const tokenCache = new Map();
-const cipherCache = new Map();
 const reportDedupe = new Map();
 
 function asJsonResponse(response) { return response.json().catch(() => null); }
@@ -53,17 +54,23 @@ async function gatewayCall(method, params, session) {
   const url = new URL(DEEZER_GW);
   url.searchParams.set("method", method); url.searchParams.set("input", "3");
   url.searchParams.set("api_version", "1.0"); url.searchParams.set("api_token", session?.apiToken || "");
-  const response = await fetch(url, {
-    method: "POST",
-    headers: { ...BROWSER_HEADERS, "Content-Type": "application/json", Cookie: `sid=${session?.sid || ""}; arl=${session?.arl || ""}` },
-    body: JSON.stringify(params || {}),
-    signal: AbortSignal.timeout(12000),
-    cache: "no-store",
-  });
-  const payload = await asJsonResponse(response);
-  if (!response.ok || payload?.error) {
-    throw errorWithStatus(`Deezer gateway ${method} failed`, response.status >= 400 ? response.status : 502, `GATEWAY_${method.toUpperCase().replace(/[^A-Z0-9]+/g, "_")}`);
+  let response;
+  try {
+    response = await fetch(url, {
+      method: "POST",
+      headers: { ...BROWSER_HEADERS, "Content-Type": "application/json", Cookie: `sid=${session?.sid || ""}; arl=${session?.arl || ""}` },
+      body: JSON.stringify(params || {}),
+      signal: AbortSignal.timeout(12000),
+      cache: "no-store",
+    });
+  } catch (cause) {
+    const code = cause?.name === "TimeoutError" || cause?.name === "AbortError" ? "GATEWAY_TIMEOUT" : "GATEWAY_NETWORK_ERROR";
+    throw errorWithStatus(`Could not reach Deezer gateway method ${method} (${code}).`, 502, code);
   }
+  const payload = await asJsonResponse(response);
+  if (!response.ok) throw errorWithStatus(`Deezer gateway method ${method} returned HTTP ${response.status}.`, response.status, `GATEWAY_HTTP_${response.status}`);
+  if (!payload || typeof payload !== "object") throw errorWithStatus(`Deezer gateway method ${method} returned an invalid JSON response.`, 502, "GATEWAY_INVALID_RESPONSE");
+  if (payload?.error) throw errorWithStatus(`Deezer gateway method ${method} rejected the request.`, 502, `GATEWAY_${method.toUpperCase().replace(/[^A-Z0-9]+/g, "_")}_REJECTED`);
   return payload;
 }
 
@@ -75,20 +82,32 @@ async function getSession(env) {
 
   const pingUrl = new URL(DEEZER_GW);
   pingUrl.searchParams.set("method", "deezer.ping"); pingUrl.searchParams.set("input", "3"); pingUrl.searchParams.set("api_version", "1.0"); pingUrl.searchParams.set("api_token", "");
-  const pingResponse = await fetch(pingUrl, {
-    method: "POST", headers: { ...BROWSER_HEADERS, "Content-Type": "application/json", Cookie: `arl=${arl}` },
-    body: "{}", signal: AbortSignal.timeout(12000), cache: "no-store",
-  });
+  let pingResponse;
+  try {
+    pingResponse = await fetch(pingUrl, {
+      method: "POST", headers: { ...BROWSER_HEADERS, "Content-Type": "application/json", Cookie: `arl=${arl}` },
+      body: "{}", signal: AbortSignal.timeout(12000), cache: "no-store",
+    });
+  } catch (cause) {
+    const code = cause?.name === "TimeoutError" || cause?.name === "AbortError" ? "ARL_PING_TIMEOUT" : "ARL_PING_NETWORK_ERROR";
+    throw errorWithStatus(`Could not establish a Deezer session (${code}).`, 502, code);
+  }
   const ping = await asJsonResponse(pingResponse);
   const sid = ping?.results?.SESSION;
   if (!pingResponse.ok || !sid) throw errorWithStatus("Deezer could not establish an authenticated session. Check DEEZER_ARL.", 502, "ARL_SESSION_FAILED");
 
   const userUrl = new URL(DEEZER_GW);
   userUrl.searchParams.set("method", "deezer.getUserData"); userUrl.searchParams.set("input", "3"); userUrl.searchParams.set("api_version", "1.0"); userUrl.searchParams.set("api_token", "null");
-  const userResponse = await fetch(userUrl, {
-    method: "POST", headers: { ...BROWSER_HEADERS, "Content-Type": "application/json", Cookie: `sid=${sid}; arl=${arl}` },
-    body: "{}", signal: AbortSignal.timeout(12000), cache: "no-store",
-  });
+  let userResponse;
+  try {
+    userResponse = await fetch(userUrl, {
+      method: "POST", headers: { ...BROWSER_HEADERS, "Content-Type": "application/json", Cookie: `sid=${sid}; arl=${arl}` },
+      body: "{}", signal: AbortSignal.timeout(12000), cache: "no-store",
+    });
+  } catch (cause) {
+    const code = cause?.name === "TimeoutError" || cause?.name === "AbortError" ? "USER_DATA_TIMEOUT" : "USER_DATA_NETWORK_ERROR";
+    throw errorWithStatus(`Could not retrieve Deezer account session data (${code}).`, 502, code);
+  }
   const userData = await asJsonResponse(userResponse);
   const user = userData?.results?.USER;
   const apiToken = userData?.results?.checkForm;
@@ -133,8 +152,8 @@ function formatLadder(quality) {
   const q = String(quality || "best").toLowerCase().replace(/[\s-]/g, "");
   if (["preview", "mp3_preview"].includes(q)) return [];
   if (["flac", "lossless", "hifi"].includes(q)) return ["FLAC", "MP3_320", "MP3_128"];
-  if (["320", "320k", "mp3320", "hq"].includes(q)) return ["MP3_320", "MP3_128", "FLAC"];
-  if (["128", "128k", "mp3128", "standard"].includes(q)) return ["MP3_128"];
+  if (["320", "320k", "mp3320", "mp3_320", "hq"].includes(q)) return ["MP3_320", "MP3_128"];
+  if (["128", "128k", "mp3128", "mp3_128", "standard"].includes(q)) return ["MP3_128"];
   return ["FLAC", "MP3_320", "MP3_128"];
 }
 function profileFor(format) {
@@ -158,36 +177,45 @@ export async function resolveFullTrack(trackId, quality, env) {
   const trackData = await getTrackTokens(trackId, session);
   const ladder = formatLadder(quality);
   if (!ladder.length) throw errorWithStatus("Preview quality does not use the full-track resolver.", 400, "PREVIEW_REQUESTED");
-  let lastError = null;
+  const attempts = [];
+
   for (const targetFormat of ladder) {
-    if (targetFormat === "FLAC" && session.canLossless === false) continue;
-    if (targetFormat === "MP3_320" && session.can320 === false) continue;
-    if (targetFormat === "FLAC" && String(trackData.FILESIZE_FLAC || "") === "0") continue;
+    if (targetFormat === "FLAC" && session.canLossless === false) { attempts.push(`${targetFormat}: account option unavailable`); continue; }
+    if (targetFormat === "MP3_320" && session.can320 === false) { attempts.push(`${targetFormat}: account option unavailable`); continue; }
+    if (targetFormat === "FLAC" && String(trackData.FILESIZE_FLAC || "") === "0") { attempts.push(`${targetFormat}: track has no FLAC asset`); continue; }
+    let response;
     try {
-      const response = await fetch(DEEZER_MEDIA_API, {
+      response = await fetch(DEEZER_MEDIA_API, {
         method: "POST", headers: { ...BROWSER_HEADERS, "Content-Type": "application/json" },
         body: JSON.stringify({ license_token: session.licenseToken, media: [{ type: "FULL", formats: [{ cipher: "BF_CBC_STRIPE", format: targetFormat }] }], track_tokens: [trackData.TRACK_TOKEN] }),
         signal: AbortSignal.timeout(15000), cache: "no-store",
       });
-      const result = await asJsonResponse(response);
-      const media = result?.data?.[0]?.media?.[0];
-      const cdnUrl = (Array.isArray(media?.sources) ? media.sources : [])
-        .map(source => safeCdnUrl(source?.url)).find(Boolean);
-      if (response.ok && cdnUrl) {
-        const actualFormat = String(media.format || targetFormat).toUpperCase();
-        if (!['FLAC', 'MP3_320', 'MP3_128'].includes(actualFormat)) {
-          lastError = errorWithStatus(`Deezer returned an unsupported media format (${actualFormat}).`, 502, "UNSUPPORTED_MEDIA_FORMAT");
-          continue;
-        }
-        return { trackId: String(trackId), format: actualFormat, profile: profileFor(actualFormat), cdnUrl };
-      }
-      const code = result?.data?.[0]?.errors?.[0]?.code || result?.errors?.[0]?.code || "";
-      lastError = errorWithStatus(`Deezer did not grant ${targetFormat} media access.`, response.status >= 400 ? response.status : 403, `MEDIA_${String(code).replace(/[^a-z0-9]/gi, "_").toUpperCase()}`);
-    } catch (error) {
-      lastError = error;
+    } catch (cause) {
+      const isTimeout = cause?.name === "TimeoutError" || cause?.name === "AbortError";
+      attempts.push(`${targetFormat}: ${isTimeout ? "timeout" : "network error"}`);
+      continue;
     }
+
+    const result = await asJsonResponse(response);
+    const dataItem = Array.isArray(result?.data) ? result.data[0] : null;
+    const media = Array.isArray(dataItem?.media) ? dataItem.media.find(x => x && Array.isArray(x.sources)) || dataItem.media[0] : null;
+    const cdnUrl = (Array.isArray(media?.sources) ? media.sources : [])
+      .map(source => safeCdnUrl(source?.url)).find(Boolean);
+    if (response.ok && cdnUrl) {
+      const actualFormat = String(media.format || targetFormat).toUpperCase();
+      if (!["FLAC", "MP3_320", "MP3_128"].includes(actualFormat)) {
+        attempts.push(`${targetFormat}: unsupported response format`);
+        continue;
+      }
+      return { trackId: String(trackId), format: actualFormat, profile: profileFor(actualFormat), cdnUrl, duration: Number(trackData.DURATION || 0) };
+    }
+    const rawCode = dataItem?.errors?.[0]?.code ?? result?.errors?.[0]?.code ?? result?.error?.code ?? "";
+    const sanitizedCode = String(rawCode).replace(/[^A-Z0-9_-]/gi, "").slice(0, 36);
+    attempts.push(`${targetFormat}: HTTP ${response.status}${sanitizedCode ? ` (${sanitizedCode})` : ""}`);
   }
-  throw lastError || errorWithStatus("No full-track format is available to this Deezer account.", 403, "FULL_TRACK_UNAVAILABLE");
+
+  const summary = attempts.length ? attempts.join("; ") : "no formats were eligible for this account";
+  throw errorWithStatus(`Deezer did not provide a usable full-track URL. Attempts: ${summary}. Check the ARL session, track entitlement, and Deezer media service availability.`, 502, "MEDIA_RESOLUTION_FAILED");
 }
 
 export async function createPlaybackToken(trackId, format, env) {
@@ -206,7 +234,7 @@ export async function validatePlaybackToken(token, env, trackId = null) {
 }
 
 async function decryptForPlayback(body, trackId, rangeStart, request) {
-  const cipher = getTrackCipher(trackId);
+  const cipher = await createWasmDecryptor(deriveTrackKey(trackId));
   let pending = new Uint8Array(0);
   let blockIndex = Math.floor(rangeStart / 2048);
   return body.pipeThrough(new TransformStream({
@@ -263,8 +291,42 @@ function sliceStream(stream, skipCount, maxCount) {
   });
 }
 
-export async function playbackResponse(request, resolved) {
-  const requestedRange = parseByteRange(request.headers.get("Range"));
+
+function prependBytesStream(prefix, stream) {
+  const reader = stream.getReader();
+  let prefixSent = false;
+  return new ReadableStream({
+    async pull(controller) {
+      if (!prefixSent) { prefixSent = true; controller.enqueue(prefix); return; }
+      const { value, done } = await reader.read();
+      if (done) { controller.close(); reader.releaseLock(); return; }
+      controller.enqueue(value);
+    },
+    async cancel(reason) { await reader.cancel(reason).catch(() => {}); },
+  });
+}
+
+export function makeHlsTimestampTag(timestamp90k = 0n) {
+  // HLS RFC 8216 packed-audio segments require this ID3 PRIV timestamp frame.
+  const owner = new TextEncoder().encode("com.apple.streaming.transportStreamTimestamp\0");
+  const ts = new Uint8Array(8);
+  let n = BigInt(timestamp90k) & ((1n << 33n) - 1n);
+  for (let i = 7; i >= 0; i--) { ts[i] = Number(n & 255n); n >>= 8n; }
+  const payload = new Uint8Array(owner.length + ts.length);
+  payload.set(owner); payload.set(ts, owner.length);
+  const syncsafe = value => Uint8Array.of((value >> 21) & 0x7f, (value >> 14) & 0x7f, (value >> 7) & 0x7f, value & 0x7f);
+  const frame = new Uint8Array(10 + payload.length);
+  frame.set(new TextEncoder().encode("PRIV"), 0); frame.set(syncsafe(payload.length), 4);
+  frame[8] = 0; frame[9] = 0; frame.set(payload, 10);
+  const header = new Uint8Array(10 + frame.length);
+  header.set(new TextEncoder().encode("ID3"), 0); header[3] = 4; header[4] = 0; header[5] = 0;
+  header.set(syncsafe(frame.length), 6); header.set(frame, 10);
+  return header;
+}
+
+export async function playbackResponse(request, resolved, options = {}) {
+  const prefixBytes = options.prefixBytes instanceof Uint8Array ? options.prefixBytes : null;
+  const requestedRange = options.ignoreRange ? null : parseByteRange(request.headers.get("Range"));
   const upstreamHeaders = { "User-Agent": BROWSER_HEADERS["User-Agent"] };
   let alignedStart = 0, alignedEnd = null;
   if (requestedRange) {
@@ -287,18 +349,19 @@ export async function playbackResponse(request, resolved) {
     outputLength = outputEnd - outputStart + 1;
   }
   const decrypted = await decryptForPlayback(upstream.body, resolved.trackId, actualStart, request);
-  const outputBody = requestedRange ? sliceStream(decrypted, outputStart - actualStart, outputLength) : decrypted;
+  let outputBody = requestedRange ? sliceStream(decrypted, outputStart - actualStart, outputLength) : decrypted;
+  if (prefixBytes && !requestedRange) outputBody = prependBytesStream(prefixBytes, outputBody);
   const headers = new Headers({
     "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
     "Access-Control-Allow-Headers": "Authorization, Content-Type, X-API-Key, Range",
     "Access-Control-Expose-Headers": "Content-Length, Content-Range, Accept-Ranges, X-Audio-Format, X-Track-ID",
-    "Content-Type": resolved.profile.mime, "Cache-Control": "private, no-store", "Accept-Ranges": "bytes",
+    "Content-Type": resolved.profile.mime, "Cache-Control": "private, no-store", "Accept-Ranges": options.ignoreRange ? "none" : "bytes",
     "X-Audio-Format": resolved.format, "X-Track-ID": String(resolved.trackId), "X-Content-Type-Options": "nosniff",
   });
   if (rangeMode) {
     headers.set("Content-Range", `bytes ${outputStart}-${outputEnd}/${total}`);
     headers.set("Content-Length", String(outputLength));
-  } else if (total) headers.set("Content-Length", String(total));
+  } else if (total) headers.set("Content-Length", String(total + (prefixBytes ? prefixBytes.byteLength : 0)));
   return new Response(outputBody, { status: rangeMode ? 206 : 200, headers });
 }
 
@@ -417,209 +480,10 @@ function deriveTrackKey(trackId) {
   return key;
 }
 
-const BF_P_INIT = [
-  0x243f6a88, 0x85a308d3, 0x13198a2e, 0x03707344, 0xa4093822, 0x299f31d0,
-  0x082efa98, 0xec4e6c89, 0x452821e6, 0x38d01377, 0xbe5466cf, 0x34e90c6c,
-  0xc0ac29b7, 0xc97c50dd, 0x3f84d5b5, 0xb5470917, 0x9216d5d9, 0x8979fb1b
-];
-
-const BF_S_BOXES_B64 = `
-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
-`;
-
-function decodeBase64(value) {
-  const normalized = String(value)
-    .replace(/\s+/g, "")
-    .replace(/-/g, "+")
-    .replace(/_/g, "/");
-
-  if (!/^[A-Za-z0-9+/]*={0,2}$/.test(normalized)) {
-    throw new Error("Invalid Base64 character");
-  }
-
-  const padded = normalized + "=".repeat((4 - (normalized.length % 4)) % 4);
-  return atob(padded);
-}
-
-const GLOBAL_TABLES = (function () {
-  const binary = decodeBase64(BF_S_BOXES_B64);
-  const buffer = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) buffer[i] = binary.charCodeAt(i);
-  const view = new DataView(buffer.buffer);
-  const sBoxes = [new Uint32Array(256), new Uint32Array(256), new Uint32Array(256), new Uint32Array(256)];
-  let offset = 0;
-  for (let b = 0; b < 4; b++) {
-    for (let i = 0; i < 256; i++) {
-      sBoxes[b][i] = view.getUint32(offset, false);
-      offset += 4;
-    }
-  }
-  return { pArray: new Uint32Array(BF_P_INIT), sBoxes };
-})();
-
-class FastBlowfish {
-  constructor(keyBytes) {
-    this.p = new Uint32Array(GLOBAL_TABLES.pArray);
-    this.s0 = new Uint32Array(GLOBAL_TABLES.sBoxes[0]);
-    this.s1 = new Uint32Array(GLOBAL_TABLES.sBoxes[1]);
-    this.s2 = new Uint32Array(GLOBAL_TABLES.sBoxes[2]);
-    this.s3 = new Uint32Array(GLOBAL_TABLES.sBoxes[3]);
-    this.initKey(keyBytes);
-  }
-
-  encBlock(xl, xr) {
-    const s0 = this.s0, s1 = this.s1, s2 = this.s2, s3 = this.s3, p = this.p;
-    for (let i = 0; i < 16; i++) {
-      xl ^= p[i];
-      const a = (xl >>> 24) & 0xff, b = (xl >>> 16) & 0xff, c = (xl >>> 8) & 0xff, d = xl & 0xff;
-      const f = (((s0[a] + s1[b]) ^ s2[c]) + s3[d]) >>> 0;
-      xr = (f ^ xr) >>> 0;
-      const tmp = xl; xl = xr; xr = tmp;
-    }
-    const tmp = xl; xl = xr; xr = tmp;
-    return [(xl ^ p[17]) >>> 0, (xr ^ p[16]) >>> 0];
-  }
-
-  initKey(key) {
-    let keyIdx = 0;
-    for (let i = 0; i < 18; i++) {
-      let data = 0;
-      for (let k = 0; k < 4; k++) {
-        data = ((data << 8) | key[keyIdx]) >>> 0;
-        keyIdx = (keyIdx + 1) % key.length;
-      }
-      this.p[i] ^= data;
-    }
-    let block = [0, 0];
-    for (let i = 0; i < 18; i += 2) {
-      block = this.encBlock(block[0], block[1]);
-      this.p[i] = block[0]; this.p[i + 1] = block[1];
-    }
-    for (let s = 0; s < 4; s++) {
-      const currentS = s === 0 ? this.s0 : s === 1 ? this.s1 : s === 2 ? this.s2 : this.s3;
-      for (let i = 0; i < 256; i += 2) {
-        block = this.encBlock(block[0], block[1]);
-        currentS[i] = block[0]; currentS[i + 1] = block[1];
-      }
-    }
-  }
-
-  decryptCBC(view, offset) {
-    let ivL = 0x00010203, ivR = 0x04050607;
-    const p = this.p;
-    const s0 = this.s0, s1 = this.s1, s2 = this.s2, s3 = this.s3;
-
-    for (let i = 0; i < 2048; i += 8) {
-      const pos = offset + i;
-      const cL = view.getUint32(pos, false);
-      const cR = view.getUint32(pos + 4, false);
-
-      let A = cL ^ p[17];
-      let B = cR ^ p[16];
-
-      B = ((((s0[(A >>> 24) & 0xff] + s1[(A >>> 16) & 0xff]) ^ s2[(A >>> 8) & 0xff]) + s3[A & 0xff]) ^ B) >>> 0; A ^= p[15];
-      A = ((((s0[(B >>> 24) & 0xff] + s1[(B >>> 16) & 0xff]) ^ s2[(B >>> 8) & 0xff]) + s3[B & 0xff]) ^ A) >>> 0; B ^= p[14];
-      B = ((((s0[(A >>> 24) & 0xff] + s1[(A >>> 16) & 0xff]) ^ s2[(A >>> 8) & 0xff]) + s3[A & 0xff]) ^ B) >>> 0; A ^= p[13];
-      A = ((((s0[(B >>> 24) & 0xff] + s1[(B >>> 16) & 0xff]) ^ s2[(B >>> 8) & 0xff]) + s3[B & 0xff]) ^ A) >>> 0; B ^= p[12];
-      B = ((((s0[(A >>> 24) & 0xff] + s1[(A >>> 16) & 0xff]) ^ s2[(A >>> 8) & 0xff]) + s3[A & 0xff]) ^ B) >>> 0; A ^= p[11];
-      A = ((((s0[(B >>> 24) & 0xff] + s1[(B >>> 16) & 0xff]) ^ s2[(B >>> 8) & 0xff]) + s3[B & 0xff]) ^ A) >>> 0; B ^= p[10];
-      B = ((((s0[(A >>> 24) & 0xff] + s1[(A >>> 16) & 0xff]) ^ s2[(A >>> 8) & 0xff]) + s3[A & 0xff]) ^ B) >>> 0; A ^= p[9];
-      A = ((((s0[(B >>> 24) & 0xff] + s1[(B >>> 16) & 0xff]) ^ s2[(B >>> 8) & 0xff]) + s3[B & 0xff]) ^ A) >>> 0; B ^= p[8];
-      B = ((((s0[(A >>> 24) & 0xff] + s1[(A >>> 16) & 0xff]) ^ s2[(A >>> 8) & 0xff]) + s3[A & 0xff]) ^ B) >>> 0; A ^= p[7];
-      A = ((((s0[(B >>> 24) & 0xff] + s1[(B >>> 16) & 0xff]) ^ s2[(B >>> 8) & 0xff]) + s3[B & 0xff]) ^ A) >>> 0; B ^= p[6];
-      B = ((((s0[(A >>> 24) & 0xff] + s1[(A >>> 16) & 0xff]) ^ s2[(A >>> 8) & 0xff]) + s3[A & 0xff]) ^ B) >>> 0; A ^= p[5];
-      A = ((((s0[(B >>> 24) & 0xff] + s1[(B >>> 16) & 0xff]) ^ s2[(B >>> 8) & 0xff]) + s3[B & 0xff]) ^ A) >>> 0; B ^= p[4];
-      B = ((((s0[(A >>> 24) & 0xff] + s1[(A >>> 16) & 0xff]) ^ s2[(A >>> 8) & 0xff]) + s3[A & 0xff]) ^ B) >>> 0; A ^= p[3];
-      A = ((((s0[(B >>> 24) & 0xff] + s1[(B >>> 16) & 0xff]) ^ s2[(B >>> 8) & 0xff]) + s3[B & 0xff]) ^ A) >>> 0; B ^= p[2];
-      B = ((((s0[(A >>> 24) & 0xff] + s1[(A >>> 16) & 0xff]) ^ s2[(A >>> 8) & 0xff]) + s3[A & 0xff]) ^ B) >>> 0; A ^= p[1];
-      A = ((((s0[(B >>> 24) & 0xff] + s1[(B >>> 16) & 0xff]) ^ s2[(B >>> 8) & 0xff]) + s3[B & 0xff]) ^ A) >>> 0; B ^= p[0];
-
-      view.setUint32(pos, ((B ^ ivL) >>> 0), false);
-      view.setUint32(pos + 4, ((A ^ ivR) >>> 0), false);
-      ivL = cL; ivR = cR;
-    }
-  }
-}
-
-function getTrackCipher(trackId) {
-  const idStr = String(trackId);
-  let cipher = cipherCache.get(idStr);
-  if (cipher) return cipher;
-
-  const key = deriveTrackKey(idStr);
-  cipher = new FastBlowfish(key);
-  cipherCache.set(idStr, cipher);
-  return cipher;
-}
-
 function decryptAlignedBuffer(cipher, buffer, startBlock, abortSignal = null) {
-  const numBlocks = Math.floor(buffer.length / 2048);
-  const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
-
-  for (let i = 0; i < numBlocks; i++) {
-    if (abortSignal && (i & 15) === 0 && abortSignal.aborted) {
-      throw new DOMException("Client aborted the stream request", "AbortError");
-    }
-    const currentBlock = startBlock + i;
-    if (currentBlock % 3 === 0) {
-      cipher.decryptCBC(view, i * 2048);
-    }
-  }
+  // WASM decrypts selected stripes in batches rather than crossing the JS/WASM
+  // boundary once per stripe. The wrapper preserves the absolute block index
+  // required for ranges and arbitrary upstream chunk boundaries.
+  if (abortSignal?.aborted) throw new DOMException("Client aborted the stream request", "AbortError");
+  cipher.decryptAligned(buffer, startBlock, abortSignal);
 }
-

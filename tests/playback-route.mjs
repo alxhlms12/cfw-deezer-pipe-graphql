@@ -26,8 +26,12 @@ globalThis.fetch = async (input, init = {}) => {
     throw new Error(`Unexpected gateway method: ${gatewayMethod}`);
   }
 
+  if (url.hostname === "api.deezer.com" && url.pathname === "/track/99") {
+    return Response.json({ id: 99, title: "Test Track", duration: 181, preview: "https://cdns-preview.dzcdn.net/test-preview.mp3" });
+  }
   if (url.hostname === "media.deezer.com" && url.pathname === "/v1/get_url") {
-    return Response.json({ data: [{ media: [{ format: "FLAC", sources: [
+    const requestedFormat = JSON.parse(init.body).media[0].formats[0].format;
+    return Response.json({ data: [{ media: [{ format: requestedFormat, sources: [
       { url: "http://bad.example/audio" }, { url: "https://cdn.dzcdn.net/route-audio" },
     ] }] }] });
   }
@@ -102,4 +106,32 @@ try {
   assert.equal(thresholdBody.accepted, true);
   assert.equal(thresholdBody.event, "30");
 } finally { Date.now = realNow; }
-console.log("Worker route integration passed (full manifest, signed playback, decrypted byte ranges, and start/30-second log.listen event flow).");
+const hlsManifestRes = await worker.fetch(new Request("https://worker.test/trackManifests/?id=99&manifestType=HLS&usgae=PLAYBACK", { headers: auth }), env);
+assert.equal(hlsManifestRes.status, 200, await hlsManifestRes.clone().text());
+const hlsManifest = await hlsManifestRes.json();
+const hlsAttributes = hlsManifest.data.data.attributes;
+assert.equal(hlsAttributes.manifestMimeType, "application/vnd.apple.mpegurl");
+assert.match(hlsAttributes.uri, /playback=manifest/);
+assert.ok(["MP3_320", "MP3_128"].includes(hlsAttributes.format));
+const hlsPlaylistResponse = await worker.fetch(new Request(hlsAttributes.uri), env);
+assert.equal(hlsPlaylistResponse.status, 200, await hlsPlaylistResponse.clone().text());
+assert.match(hlsPlaylistResponse.headers.get("Content-Type"), /application\/vnd\.apple\.mpegurl/);
+const hlsPlaylist = await hlsPlaylistResponse.text();
+assert.match(hlsPlaylist, /^#EXTM3U/m);
+assert.match(hlsPlaylist, /#EXT-X-ENDLIST/);
+const hlsSegmentUrl = hlsPlaylist.split("\n").find(line => line.startsWith("https://worker.test/track?") && line.includes("hlsSegment=1"));
+assert.ok(hlsSegmentUrl, "expected a signed HLS segment URL");
+const hlsSegment = await worker.fetch(new Request(hlsSegmentUrl), env);
+assert.equal(hlsSegment.status, 200, await hlsSegment.clone().text());
+assert.equal(hlsSegment.headers.get("Content-Type"), "audio/mpeg");
+const packedAudio = new Uint8Array(await hlsSegment.arrayBuffer());
+assert.equal(String.fromCharCode(...packedAudio.subarray(0, 3)), "ID3");
+assert.equal(packedAudio.byteLength, audio.length + (await import("../src/playback.js")).makeHlsTimestampTag().byteLength);
+
+const dashUnsupported = await worker.fetch(new Request("https://worker.test/trackManifests?id=99&manifestType=MPEG_DASH", { headers: auth }), env);
+assert.equal(dashUnsupported.status, 406);
+assert.equal((await dashUnsupported.json()).error.code, "MANIFEST_TYPE_UNSUPPORTED");
+const downloadUnsupported = await worker.fetch(new Request("https://worker.test/trackManifests?id=99&usage=DOWNLOAD", { headers: auth }), env);
+assert.equal(downloadUnsupported.status, 501);
+assert.equal((await downloadUnsupported.json()).error.code, "USAGE_UNSUPPORTED");
+console.log("Worker route integration passed (full manifest, signed playback, WASM-decrypted byte ranges, HLS playlist/packed MP3 segment, and listen-event flow).");

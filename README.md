@@ -11,7 +11,7 @@ Cloudflare Worker implementation with a Tidal `hifi-api`-style response envelope
 - `POST /track?log=listen` sends best-effort start/30-second listen events to Deezer's undocumented `log.listen` gateway method. The `start` event returns a refreshed signed `playToken` containing the listening start time; use that token for the 30-second event. This is an unofficial gateway protocol, so an accepted HTTP response is not proof of royalties, play-count, or listening-history credit.
 - Full-track resolution uses Deezer's authenticated media endpoint and its `BF_CBC_STRIPE` format, decrypted inside the Worker. It is unofficial and may break if Deezer changes the private endpoint; the Worker only asks for formats currently offered to the configured account. No arbitrary URL proxy or Widevine route is included.
 - Catalog responses are not cached; all responses have `Cache-Control: no-store` for repeatable testing. Only the short-lived Pipe JWT is held in module memory for auth efficiency.
-- The included WASM module calculates bounded Levenshtein distance for `/cover?q=` title matching. It is not an audio decoder or encryption/decryption module.
+- The project includes two compiled WASM modules: bounded Levenshtein distance for `/cover?q=` matching and the Blowfish stripe transform used by the authenticated progressive/HLS MP3 playback path. The MD5-derived track-key setup remains in JavaScript; the per-stripe decryption transform runs in WASM.
 
 ## Deploy
 
@@ -45,7 +45,7 @@ Routes are `GET` except `POST /track?log=listen` and `OPTIONS` CORS preflight. Q
 | `/` | none | Local service info | `{version, Repo}` |
 | `/info` | `id` | Deezer `track/{id}` | `{version, data}`; maps supported track fields and marks preview availability honestly |
 | `/track` | `id`; optional `quality`; internal signed playback URL uses `playback=1&pt=...` | Deezer preview API or authenticated `song.getListData` → `media.deezer.com/v1/get_url` → Deezer CDN | Tidal-style manifest wrapper for preview/full format; with `playback=1`, returns decrypted audio bytes and supports single byte ranges |
-| `/trackManifests` | `id`; optional `formats`, `quality`, `uriScheme` | Deezer preview API or authenticated media resolver | Tidal v2.7-style manifest wrapper with `trackPresentation: PREVIEW` or `FULL`, actual available format, and a short-lived signed playback URL |
+| `/trackManifests` | `id`; optional `formats`, `quality`, `uriScheme` | Deezer preview API or authenticated media resolver | Tidal v2.7-style manifest wrapper with preview/progressive full-audio URLs; `manifestType=HLS` returns a single packed-MP3 VOD playlist and short-lived signed segment URL. MPEG-DASH is explicitly unsupported. |
 | `POST /track?log=listen` | JSON body `{trackId, playToken, event}` where `event` is `start` or `30` | Deezer internal `gw-light.php` `log.listen` method | Best-effort telemetry result; the `start` response returns an updated `playToken` for the 30-second event |
 | `/recommendations` | `id`; optional `limit`, `offset` | Deezer `track/{id}/radio` | `{version,data:{limit,offset,totalNumberOfItems,items:[{track,sources}]}}` |
 | `/search` | exactly one of `s`, `a`, `al`, `p`, `i`; optional `limit`, `offset` | Pipe GraphQL on first page when configured; REST fallback | track results under `data`; artist, album, playlist results nested under `data.artists`, `data.albums`, `data.playlists` |
@@ -72,12 +72,12 @@ GET /recommendations?id=3135556&limit=20
 GET /artist/similar?id=27
 ```
 
-The track identifier examples are illustrative; a route can return `404` or a preview-unavailable error when a track is removed, region-limited, or has no preview.
+The track identifier examples are illustrative; a route can return `404` or a preview-unavailable error when a track is removed, region-limited, or has no preview. For full playback, `MEDIA_RESOLUTION_FAILED` includes sanitized per-format HTTP/error codes (for example, HTTP 403) so an upstream entitlement/session rejection is distinguishable from a Worker parser failure. Raw upstream response bodies and credentials are not returned.
 
 
 ### Full-track playback and listen reporting
 
-With both secrets configured, request a manifest with `GET /trackManifests?id=<id>` or `GET /track?id=<id>`, authenticating that request with `Authorization: Bearer <API_KEY>`. The response contains a `playbackToken` and a signed `streamUrl`/`uri`. Use that URL as the audio source; the signed URL expires after 30 minutes and is bound to the requested track and format. `quality=best` tries FLAC, then MP3 320, then MP3 128 subject to account entitlement. `quality=PREVIEW` explicitly requests only the public preview.
+With both secrets configured, request a manifest with `GET /trackManifests?id=<id>` or `GET /track?id=<id>`, authenticating that request with `Authorization: Bearer <API_KEY>`. The response contains a `playbackToken` and a signed progressive URL; the signed URL expires after 30 minutes and is bound to the requested track and format. `quality=best` tries FLAC, then MP3 320, then MP3 128 subject to account entitlement. `quality=PREVIEW` explicitly requests only the public preview. `manifestType=HLS` returns a single-file HLS VOD playlist using MP3_320 (falling back to MP3_128) because raw FLAC is not a supported HLS packed-audio segment. The playlist URI itself is signed and expires with the token. `manifestType=MPEG_DASH` is not implemented and returns `MANIFEST_TYPE_UNSUPPORTED`; omit `manifestType` for progressive FLAC/MP3 playback. `usage=DOWNLOAD` returns `USAGE_UNSUPPORTED`; the legacy misspelling `usgae=PLAYBACK` is accepted for compatibility.
 
 The Worker cannot observe whether a client actually plays audio, so the client should report the events from its media player's real playback events—not merely from a manifest request. At `playing`, POST `{ "trackId": "<id>", "playToken": "<manifest playbackToken>", "event": "start" }` to `/track?log=listen`. Save the returned updated `playToken`; once `audio.currentTime >= 30`, POST the same body with that updated token and `event: "30"`. These telemetry requests can run asynchronously and should not block playback. Use `fetch(..., {method:"POST", keepalive:true, headers:{"Content-Type":"text/plain"}, body:JSON.stringify(body)})` or a `sendBeacon` for transport. The Worker enforces that the 30-second event follows a signed start event at least 30 seconds earlier, but because Deezer's gateway and listen-count rules are undocumented, the endpoint response cannot guarantee that Deezer credited a qualifying play or royalties.
 
@@ -113,11 +113,14 @@ The Tidal README is the compatibility reference for route names, wrappers, pagin
 
 ```text
 wasm/match.wasm          compiled bounded string-distance helper
-src/match.c              source for that helper
+src/match.c              source for the string-distance helper
 src/wasm-match.js        Worker wrapper with JavaScript fallback
+wasm/decrypt.wasm        compiled Blowfish stripe transform
+src/decrypt.c            source for the Blowfish transform
+src/wasm-decrypt.js      key setup, per-track cipher cache, batched WASM calls
 ```
 
-The `CompiledWasm` rule in `wrangler.toml` is required so Wrangler bundles the module correctly. The binary was smoke-tested by instantiating it and checking a string edit distance. The Worker wrapper handles Wrangler’s `CompiledWasm` module import as well as byte-based instantiation, and falls back to a JavaScript implementation if the optional helper cannot run. The playback smoke tests also mock Deezer authentication, media resolution, CDN responses, range playback, and a `log.listen` start request; they do not prove live Deezer acceptance or royalty credit.
+The `CompiledWasm` rule in `wrangler.toml` is required so Wrangler bundles the modules correctly. The decryption wrapper caches up to 64 initialized ciphers per isolate and batches selected encrypted stripes to reduce JavaScript/WASM boundary crossings. Tests compare the WASM output with three single-stripe and two aligned-buffer reference vectors, including a multi-batch buffer. Local synthetic-buffer benchmarks show performance close to the previous JavaScript path; WASM is not guaranteed to be faster on every runtime or chunk size. Playback tests mock Deezer authentication, media resolution, CDN responses, byte-range playback, single-file HLS output, and listen events; mocks do not prove live Deezer access or royalty credit.
 
 ## Sources checked
 
