@@ -6,8 +6,10 @@ Cloudflare Worker implementation with a Tidal `hifi-api`-style response envelope
 
 - Catalog requests stay separate from media resolution. Search, artist, album, and playlist routes do not fetch or decrypt audio.
 - Public Deezer REST API is the fallback source for catalog lookups. If `DEEZER_ARL` is configured, page-zero catalog searches use Pipe GraphQL first and fall back to REST if Pipe fails. Pipe is unofficial and may change without notice.
-- `GET /track` and `GET /trackManifests` return only Deezer's official short MP3 preview URL when one exists. They never label a preview as FLAC/full-track media.
-- No `/stream` route, full-track audio decryption, arbitrary URL proxy, Widevine handler, or full lyrics relay is included.
+- Catalog routes do not resolve audio. `GET /track` and `GET /trackManifests` use the official 30-second preview when `quality=PREVIEW` is requested or no ARL is configured; with a server-side `DEEZER_ARL`, they can resolve an account-entitled full-track format.
+- Full audio is served through `GET /track?id=...&playback=1&quality=...&pt=...`; this is deliberately not a separate `/stream` route. The short-lived signed `pt` token binds playback to one track and format, and the Worker fetches only HTTPS Deezer media hosts.
+- `POST /track?log=listen` sends best-effort start/30-second listen events to Deezer's undocumented `log.listen` gateway method. The `start` event returns a refreshed signed `playToken` containing the listening start time; use that token for the 30-second event. This is an unofficial gateway protocol, so an accepted HTTP response is not proof of royalties, play-count, or listening-history credit.
+- Full-track resolution uses Deezer's authenticated media endpoint and its `BF_CBC_STRIPE` format, decrypted inside the Worker. It is unofficial and may break if Deezer changes the private endpoint; the Worker only asks for formats currently offered to the configured account. No arbitrary URL proxy or Widevine route is included.
 - Catalog responses are not cached; all responses have `Cache-Control: no-store` for repeatable testing. Only the short-lived Pipe JWT is held in module memory for auth efficiency.
 - The included WASM module calculates bounded Levenshtein distance for `/cover?q=` title matching. It is not an audio decoder or encryption/decryption module.
 
@@ -16,34 +18,35 @@ Cloudflare Worker implementation with a Tidal `hifi-api`-style response envelope
 1. Install Node.js 20+.
 2. From this folder run `npm install`.
 3. Run `npm run check` and `npm test`.
-4. Optional: add `DEEZER_ARL` as a Cloudflare Worker secret to enable Pipe GraphQL for search:
+4. Add the Deezer ARL as a Cloudflare Worker secret:
 
    ```sh
    npx wrangler secret put DEEZER_ARL
    ```
 
-5. Optional: set `API_KEY` as a Cloudflare Worker secret if the deployed API should require client authentication:
+5. Add a long random API key as a second secret:
 
    ```sh
    npx wrangler secret put API_KEY
    ```
 
-   When configured, send `Authorization: Bearer <API_KEY>` or `X-API-Key: <API_KEY>`. This is deliberately optional because the safe default uses public catalog requests without credentials. Do not put `DEEZER_ARL` in frontend code or in query parameters.
+   Use `Authorization: Bearer <API_KEY>` or `X-API-Key: <API_KEY>` when requesting manifests/catalog routes. The generated signed audio URL and listen-reporting requests don't need the long-lived key header, but their signed token expires after 30 minutes. Do not put the ARL or the long-lived API key in public frontend code, logs, or a public repository.
 
 6. Run locally using `npm run dev`, or deploy with `npm run deploy`.
 
-There are **no required environment variables**. `DEEZER_ARL` and `API_KEY` are optional; the latter is recommended for any public deployment. The Worker also applies a best-effort per-isolate limit of 120 requests per IP per minute. Use Cloudflare-level rate limiting for a durable distributed limit if you expose it publicly.
+`DEEZER_ARL` and `API_KEY` are both required for full-track playback. Catalog-only use without those secrets still works through the public REST API. The Worker applies a best-effort per-isolate limit of 120 requests per IP per minute; use Cloudflare-level rate limiting for durable distributed limits on public deployments.
 
 ## Routes
 
-All routes are `GET` only except for `OPTIONS` CORS preflight. Query parameters are validated; errors use `{ "version": "3.0.0", "error": { "code", "message", "requestId" } }`. Routes return `Cache-Control: no-store`.
+Routes are `GET` except `POST /track?log=listen` and `OPTIONS` CORS preflight. Query parameters are validated; errors use `{ "version": "3.0.0", "error": { "code", "message", "requestId" } }`. Responses are not cached.
 
 | Route | Query | Upstream / behavior | Response shape |
 |---|---|---|---|
 | `/` | none | Local service info | `{version, Repo}` |
 | `/info` | `id` | Deezer `track/{id}` | `{version, data}`; maps supported track fields and marks preview availability honestly |
-| `/track` | `id`; optional `quality` | Deezer `track/{id}` | Tidal-style track manifest wrapper holding a base64 JSON preview descriptor; preview only |
-| `/trackManifests` | `id`; optional `formats`, `uriScheme` | Deezer `track/{id}` | Tidal v2.7-style `{data:{data:{id,type,attributes},links}}`, with `trackPresentation: PREVIEW` and `formats: ["MP3_PREVIEW"]` |
+| `/track` | `id`; optional `quality`; internal signed playback URL uses `playback=1&pt=...` | Deezer preview API or authenticated `song.getListData` → `media.deezer.com/v1/get_url` → Deezer CDN | Tidal-style manifest wrapper for preview/full format; with `playback=1`, returns decrypted audio bytes and supports single byte ranges |
+| `/trackManifests` | `id`; optional `formats`, `quality`, `uriScheme` | Deezer preview API or authenticated media resolver | Tidal v2.7-style manifest wrapper with `trackPresentation: PREVIEW` or `FULL`, actual available format, and a short-lived signed playback URL |
+| `POST /track?log=listen` | JSON body `{trackId, playToken, event}` where `event` is `start` or `30` | Deezer internal `gw-light.php` `log.listen` method | Best-effort telemetry result; the `start` response returns an updated `playToken` for the 30-second event |
 | `/recommendations` | `id`; optional `limit`, `offset` | Deezer `track/{id}/radio` | `{version,data:{limit,offset,totalNumberOfItems,items:[{track,sources}]}}` |
 | `/search` | exactly one of `s`, `a`, `al`, `p`, `i`; optional `limit`, `offset` | Pipe GraphQL on first page when configured; REST fallback | track results under `data`; artist, album, playlist results nested under `data.artists`, `data.albums`, `data.playlists` |
 | `/album` | `id`; optional `limit`, `offset` | Deezer `album/{id}` and `album/{id}/tracks` in parallel | `{version,data:{...album,numberOfTracks,items,pagination}}` |
@@ -64,11 +67,21 @@ GET /search?al=Discovery&limit=20&offset=0
 GET /search?p=electronic&limit=10
 GET /search?i=USQX91400008
 GET /trackManifests?id=3135556
+GET /trackManifests?id=3135556&quality=FLAC
 GET /recommendations?id=3135556&limit=20
 GET /artist/similar?id=27
 ```
 
 The track identifier examples are illustrative; a route can return `404` or a preview-unavailable error when a track is removed, region-limited, or has no preview.
+
+
+### Full-track playback and listen reporting
+
+With both secrets configured, request a manifest with `GET /trackManifests?id=<id>` or `GET /track?id=<id>`, authenticating that request with `Authorization: Bearer <API_KEY>`. The response contains a `playbackToken` and a signed `streamUrl`/`uri`. Use that URL as the audio source; the signed URL expires after 30 minutes and is bound to the requested track and format. `quality=best` tries FLAC, then MP3 320, then MP3 128 subject to account entitlement. `quality=PREVIEW` explicitly requests only the public preview.
+
+The Worker cannot observe whether a client actually plays audio, so the client should report the events from its media player's real playback events—not merely from a manifest request. At `playing`, POST `{ "trackId": "<id>", "playToken": "<manifest playbackToken>", "event": "start" }` to `/track?log=listen`. Save the returned updated `playToken`; once `audio.currentTime >= 30`, POST the same body with that updated token and `event: "30"`. These telemetry requests can run asynchronously and should not block playback. Use `fetch(..., {method:"POST", keepalive:true, headers:{"Content-Type":"text/plain"}, body:JSON.stringify(body)})` or a `sendBeacon` for transport. The Worker enforces that the 30-second event follows a signed start event at least 30 seconds earlier, but because Deezer's gateway and listen-count rules are undocumented, the endpoint response cannot guarantee that Deezer credited a qualifying play or royalties.
+
+This path uses private, undocumented Deezer endpoints, not a public SDK contract. Test with your own account and verify listening history in Deezer rather than treating a successful HTTP response as proof that tracking worked.
 
 ## Upstream endpoint research
 
@@ -94,7 +107,7 @@ The public REST search supports `index` rather than the Tidal README's `offset`;
 
 ### Response contract decisions
 
-The Tidal README is the compatibility reference for route names, wrappers, pagination keys, and `trackManifests` nesting. Deezer fields are mapped where their meaning is comparable. The build intentionally doesn't invent Tidal-only `bpm`, key, replay gain, DRM, Atmos, FLAC, or audio-normalization information. The preview manifest says `PREVIEW` and returns `MP3_PREVIEW`; if a track has no official preview URL, the route returns a clear `404` instead of manufacturing a media URL.
+The Tidal README is the compatibility reference for route names, wrappers, pagination keys, and `trackManifests` nesting. Deezer fields are mapped where their meaning is comparable. Full media resolution is isolated to `/track` and `/trackManifests` requests; ordinary search and metadata requests never fetch or decrypt audio. Preview manifests say `PREVIEW` and return `MP3_PREVIEW`; if a track has no official preview URL, the route returns `404` instead of manufacturing a preview URL.
 
 ## WASM layout
 
@@ -104,7 +117,7 @@ src/match.c              source for that helper
 src/wasm-match.js        Worker wrapper with JavaScript fallback
 ```
 
-The `CompiledWasm` rule in `wrangler.toml` is required so Wrangler bundles the module correctly. The binary was smoke-tested by instantiating it and checking a string edit distance. The Worker wrapper handles Wrangler’s `CompiledWasm` module import as well as byte-based instantiation, and falls back to a JavaScript implementation if the optional helper cannot run.
+The `CompiledWasm` rule in `wrangler.toml` is required so Wrangler bundles the module correctly. The binary was smoke-tested by instantiating it and checking a string edit distance. The Worker wrapper handles Wrangler’s `CompiledWasm` module import as well as byte-based instantiation, and falls back to a JavaScript implementation if the optional helper cannot run. The playback smoke tests also mock Deezer authentication, media resolution, CDN responses, range playback, and a `log.listen` start request; they do not prove live Deezer acceptance or royalty credit.
 
 ## Sources checked
 
@@ -114,5 +127,7 @@ The `CompiledWasm` rule in `wrangler.toml` is required so Wrangler bundles the m
 - [Pipe GraphQL search query schema](https://github.com/music-assistant/deezer-python-gql/blob/main/queries/search.graphql)
 - [Pipe GraphQL track query schema](https://github.com/music-assistant/deezer-python-gql/blob/main/queries/get_track.graphql)
 - [Deezer Python client route methods](https://deezer-python.readthedocs.io/en/v7.0.0/api_reference/client.html)
+- [OpenDeezer private media-resolution and authenticated playback overview](https://github.com/Cycl0o0/OpenDeezer)
+- [Observed `log.listen` request structure](https://gist.github.com/TavoElgueaLopez/d15827f246b27cf3130e77b5468fe434)
 
 Pipe field names and authentication behavior were checked against the current public source on 2026-10-15. Because Pipe is not a stable public API, deploy-time/live behavior still needs verification with the target Deezer account.

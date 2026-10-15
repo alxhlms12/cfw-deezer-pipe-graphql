@@ -1,4 +1,5 @@
 import { distance } from "./wasm-match.js";
+import { createPlaybackToken, playbackResponse, reportListen, resolveFullTrack, validatePlaybackToken } from "./playback.js";
 import {
   getAlbum, getAlbumTracks, getArtist, getArtistAlbums, getArtistTop, getRelatedArtists,
   getPlaylist, getPlaylistTracks, getTrack, getTrackRadio, mapAlbum, mapAlbumSummary,
@@ -7,8 +8,9 @@ import {
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, OPTIONS",
-  "Access-Control-Allow-Headers": "Authorization, Content-Type, X-API-Key",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Authorization, Content-Type, X-API-Key, Range",
+  "Access-Control-Expose-Headers": "Content-Length, Content-Range, Accept-Ranges, X-Audio-Format, X-Track-ID",
   "Access-Control-Max-Age": "86400",
 };
 const rateWindows = new Map();
@@ -17,20 +19,32 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     const requestId = crypto.randomUUID();
+    const route = url.pathname.replace(/\/+$/, "") || "/";
+    const listenRoute = route === "/track" && url.searchParams.get("log") === "listen";
+    const signedPlaybackRoute = route === "/track" && url.searchParams.get("playback") === "1";
     if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: headers() });
-    if (request.method !== "GET") return fail(405, "METHOD_NOT_ALLOWED", "This endpoint only accepts GET requests.", requestId, { Allow: "GET, OPTIONS" });
+    if (listenRoute ? request.method !== "POST" : request.method !== "GET") {
+      return fail(405, "METHOD_NOT_ALLOWED", listenRoute ? "Listen events must be sent with POST." : "This endpoint accepts GET requests, plus POST for /track?log=listen.", requestId, { Allow: listenRoute ? "POST, OPTIONS" : "GET, OPTIONS" });
+    }
 
-    const authError = authorize(request, env);
-    if (authError) return fail(401, "UNAUTHORIZED", authError, requestId);
+    // Audio and telemetry URLs use short-lived HMAC-signed playback tokens. The
+    // manifest itself remains protected by API_KEY; ARL is never sent to clients.
+    if (listenRoute || signedPlaybackRoute) {
+      if (!env?.API_KEY) return fail(503, "PLAYBACK_API_KEY_REQUIRED", "Configure API_KEY as a Cloudflare secret to sign and validate playback URLs.", requestId);
+    } else {
+      const authError = authorize(request, env);
+      if (authError) return fail(401, "UNAUTHORIZED", authError, requestId);
+    }
     const rateError = checkRateLimit(request);
     if (rateError) return fail(429, "RATE_LIMITED", "Too many requests from this client. Retry shortly.", requestId, { "Retry-After": "15" });
 
-    const route = url.pathname.replace(/\/+$/, "") || "/";
     try {
-      if (route === "/") return json({ version: version(), Repo: "Deezer catalog API rebuild (Tidal HiFi response-schema compatibility)" });
+      if (listenRoute) return await trackListen(request, url, env);
+      if (signedPlaybackRoute) return await fullTrackAudio(request, url, env);
+      if (route === "/") return json({ version: version(), Repo: "Deezer catalog and authenticated playback API (Tidal HiFi response-schema compatibility)" });
       if (route === "/info") return await trackInfo(url);
-      if (route === "/track") return await trackManifestLegacy(url);
-      if (route === "/trackManifests") return await trackManifests(url);
+      if (route === "/track") return await trackManifestLegacy(url, env);
+      if (route === "/trackManifests") return await trackManifests(url, env);
       if (route === "/recommendations") return await recommendations(url);
       if (route === "/search") return await search(url, env);
       if (route === "/album") return await album(url, env);
@@ -55,12 +69,29 @@ async function trackInfo(url) {
   return json({ version: version(), data: mapTrack(t) });
 }
 
-async function trackManifestLegacy(url) {
+async function trackManifestLegacy(url, env) {
   const id = requiredId(url);
-  const requestedQuality = (url.searchParams.get("quality") || "PREVIEW").toUpperCase();
-  if (!["PREVIEW", "MP3_PREVIEW"].includes(requestedQuality)) {
-    return fail(406, "QUALITY_UNAVAILABLE", "This public Deezer adapter supports only Deezer's official MP3 preview, not full-track or lossless manifests.");
-  }
+  const requestedQuality = (url.searchParams.get("quality") || (env?.DEEZER_ARL ? "best" : "PREVIEW")).toUpperCase();
+  if (["PREVIEW", "MP3_PREVIEW"].includes(requestedQuality)) return previewTrackManifest(id, url);
+  if (!env?.DEEZER_ARL) return fail(503, "ARL_REQUIRED", "Set DEEZER_ARL to enable authenticated full-track resolution. Use quality=PREVIEW for public preview audio.");
+  if (!env?.API_KEY) return fail(503, "PLAYBACK_API_KEY_REQUIRED", "Set API_KEY as a Cloudflare secret before issuing full-track playback URLs.");
+
+  const resolved = await resolveFullTrack(id, requestedQuality, env);
+  const { token } = await createPlaybackToken(id, resolved.format, env);
+  const playbackUrl = makePlaybackUrl(url, id, resolved.format, token);
+  const manifest = {
+    mimeType: resolved.profile.mime, codecs: resolved.profile.codecs,
+    encryptionType: "NONE", presentation: "FULL", urls: [playbackUrl],
+  };
+  return json({ version: "3.1", data: {
+    trackId: Number(id), assetPresentation: "FULL", audioMode: "STEREO",
+    audioQuality: resolved.profile.badge, format: resolved.format, streamReady: true,
+    manifestMimeType: "application/json", manifest: toBase64(JSON.stringify(manifest)),
+    streamUrl: playbackUrl, playbackToken: token,
+  } });
+}
+
+async function previewTrackManifest(id, _url) {
   const t = await getTrack(id);
   const preview = safeHttpsUrl(t.preview);
   if (!preview) return fail(404, "PREVIEW_UNAVAILABLE", "Deezer did not provide a preview URL for this track.");
@@ -72,25 +103,89 @@ async function trackManifestLegacy(url) {
   } });
 }
 
-async function trackManifests(url) {
+async function trackManifests(url, env) {
   const id = requiredId(url);
   const normalized = url.searchParams.getAll("formats").flatMap(v => v.split(",")).map(v => v.trim().toUpperCase()).filter(Boolean);
-  if (normalized.length && !normalized.some(v => ["PREVIEW", "MP3_PREVIEW"].includes(v))) {
-    return fail(406, "FORMAT_UNAVAILABLE", "Only Deezer's official preview MP3 is available from this adapter; requested lossless/full-track formats are not exposed.");
+  const qualityParam = String(url.searchParams.get("quality") || "").toUpperCase();
+  const previewOnly = (normalized.length > 0 && normalized.every(v => ["PREVIEW", "MP3_PREVIEW"].includes(v))) || ["PREVIEW", "MP3_PREVIEW"].includes(qualityParam);
+  const supported = new Set(["PREVIEW", "MP3_PREVIEW", "FLAC", "LOSSLESS", "HIFI", "MP3_320", "320", "MP3_128", "128", "BEST"]);
+  const invalid = normalized.filter(v => !supported.has(v));
+  if (invalid.length) return fail(406, "FORMAT_UNAVAILABLE", `Unsupported formats: ${invalid.join(", ")}. Supported values: PREVIEW, FLAC, MP3_320, MP3_128, BEST.`);
+
+  if (previewOnly || !env?.DEEZER_ARL) {
+    if (!previewOnly && ((normalized.length && normalized.some(v => !["PREVIEW", "MP3_PREVIEW"].includes(v))) || (qualityParam && !["PREVIEW", "MP3_PREVIEW"].includes(qualityParam)))) {
+      return fail(503, "ARL_REQUIRED", "Set DEEZER_ARL to enable authenticated full-track resolution.");
+    }
+    const t = await getTrack(id);
+    const preview = safeHttpsUrl(t.preview);
+    if (!preview) return fail(404, "PREVIEW_UNAVAILABLE", "Deezer did not provide a preview URL for this track.");
+    const useData = (url.searchParams.get("uriScheme") || "HTTPS").toUpperCase() === "DATA";
+    const manifest = { mimeType: "audio/mpeg", codecs: "mp3", encryptionType: "NONE", presentation: "PREVIEW", urls: [preview] };
+    const self = `${url.pathname}${url.search}`;
+    return json({ version: "2.7", data: { data: {
+      id: String(t.id), type: "trackManifests", attributes: {
+        trackPresentation: "PREVIEW", uri: useData ? `data:application/json;base64,${toBase64(JSON.stringify(manifest))}` : preview,
+        formats: ["MP3_PREVIEW"], previewDuration: 30,
+        ...(useData ? { manifestMimeType: "application/json" } : {}),
+      },
+    }, links: { self } } });
   }
-  const t = await getTrack(id);
-  const preview = safeHttpsUrl(t.preview);
-  if (!preview) return fail(404, "PREVIEW_UNAVAILABLE", "Deezer did not provide a preview URL for this track.");
+  if (!env?.API_KEY) return fail(503, "PLAYBACK_API_KEY_REQUIRED", "Set API_KEY as a Cloudflare secret before issuing full-track playback URLs.");
+
+  let quality = url.searchParams.get("quality");
+  if (!quality && normalized.length) quality = normalized.find(v => !["PREVIEW", "MP3_PREVIEW"].includes(v));
+  const resolved = await resolveFullTrack(id, quality || "best", env);
+  const { token } = await createPlaybackToken(id, resolved.format, env);
+  const playbackUrl = makePlaybackUrl(url, id, resolved.format, token);
+  const manifest = { mimeType: resolved.profile.mime, codecs: resolved.profile.codecs, encryptionType: "NONE", presentation: "FULL", urls: [playbackUrl] };
   const useData = (url.searchParams.get("uriScheme") || "HTTPS").toUpperCase() === "DATA";
-  const manifest = { mimeType: "audio/mpeg", codecs: "mp3", encryptionType: "NONE", presentation: "PREVIEW", urls: [preview] };
-  const uri = useData ? `data:application/json;base64,${toBase64(JSON.stringify(manifest))}` : preview;
   const self = `${url.pathname}${url.search}`;
   return json({ version: "2.7", data: { data: {
-    id: String(t.id), type: "trackManifests", attributes: {
-      trackPresentation: "PREVIEW", uri, formats: ["MP3_PREVIEW"], previewDuration: 30,
-      ...(useData ? { manifestMimeType: "application/json" } : {}),
+    id: String(id), type: "trackManifests", attributes: {
+      trackPresentation: "FULL", uri: useData ? `data:application/json;base64,${toBase64(JSON.stringify(manifest))}` : playbackUrl,
+      formats: [resolved.format], audioQuality: resolved.profile.badge, format: resolved.format,
+      playbackToken: token, ...(useData ? { manifestMimeType: "application/json" } : {}),
     },
   }, links: { self } } });
+}
+
+function makePlaybackUrl(baseUrl, id, format, token) {
+  const playback = new URL("/track", baseUrl.origin);
+  playback.searchParams.set("id", String(id));
+  playback.searchParams.set("quality", String(format));
+  playback.searchParams.set("playback", "1");
+  playback.searchParams.set("pt", token);
+  return playback.toString();
+}
+
+async function fullTrackAudio(request, url, env) {
+  const id = requiredId(url);
+  const claims = await validatePlaybackToken(url.searchParams.get("pt"), env, id);
+  if (!claims) return fail(401, "PLAYBACK_TOKEN_INVALID", "Playback URL is invalid or expired; request a fresh track manifest.");
+  const requestedQuality = (url.searchParams.get("quality") || claims.format).toUpperCase();
+  if (requestedQuality !== claims.format) return fail(403, "PLAYBACK_FORMAT_MISMATCH", "Playback quality does not match the signed URL.");
+  const resolved = await resolveFullTrack(id, claims.format, env);
+  if (resolved.format !== claims.format) return fail(403, "PLAYBACK_ENTITLEMENT_CHANGED", "The requested format is no longer available for this account. Request a fresh manifest.");
+  try {
+    return await playbackResponse(request, resolved);
+  } catch (error) {
+    const status = Number.isInteger(error?.status) ? error.status : 502;
+    return fail(status, error?.code || "PLAYBACK_FAILED", error?.message || "Playback failed.");
+  }
+}
+
+async function trackListen(request, url, env) {
+  let body;
+  try { body = JSON.parse(await request.text()); }
+  catch { return fail(400, "INVALID_LISTEN_BODY", "POST a JSON body containing trackId, playToken, and event."); }
+  const id = String(body?.trackId ?? url.searchParams.get("id") ?? "");
+  if (!/^\d+$/.test(id)) return fail(400, "INVALID_ID", "trackId must be a numeric Deezer track ID.");
+  try {
+    const result = await reportListen({ trackId: id, playToken: body?.playToken ?? url.searchParams.get("pt"), event: body?.event }, env);
+    return json({ version: version(), ...result }, 202);
+  } catch (error) {
+    return fail(Number.isInteger(error?.status) ? error.status : 502, error?.code || "LISTEN_REPORT_FAILED", error?.message || "Deezer listen reporting failed.");
+  }
 }
 
 async function recommendations(url) {
