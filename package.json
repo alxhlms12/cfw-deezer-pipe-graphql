@@ -1,0 +1,15 @@
+{
+  "name": "deezer-hifi-api-rebuild",
+  "version": "3.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check": "node --check src/index.js && node --check src/deezer.js && node --check src/wasm-match.js",
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "test": "npm run check && node tests/wasm-smoke.mjs && node tests/catalog-smoke.mjs"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}

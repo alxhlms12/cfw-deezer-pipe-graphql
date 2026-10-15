@@ -1,0 +1,10 @@
+name = "deezer-hifi-api-rebuild"
+main = "src/index.js"
+compatibility_date = "2026-10-15"
+workers_dev = true
+
+# Cloudflare compiles the bounded metadata matcher into a WASM module at bundle time.
+[[rules]]
+type = "CompiledWasm"
+globs = ["**/*.wasm"]
+fallthrough = false
