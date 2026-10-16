@@ -7,7 +7,7 @@
     "check": "node --check src/index.js && node --check src/deezer.js && node --check src/wasm-match.js && node --check src/wasm-decrypt.js && node --check src/playback.js",
     "deploy": "wrangler deploy",
     "dev": "wrangler dev",
-    "test": "npm run check && node tests/wasm-smoke.mjs && node --experimental-loader=./tests/wasm-loader.mjs tests/wasm-decrypt-smoke.mjs && node tests/catalog-smoke.mjs && node --experimental-loader=./tests/wasm-loader.mjs tests/playback-smoke.mjs && node --experimental-loader=./tests/wasm-loader.mjs tests/playback-integration.mjs && node --experimental-loader=./tests/wasm-loader.mjs tests/playback-route.mjs"
+    "test": "npm run check && node tests/wasm-smoke.mjs && node --experimental-loader=./tests/wasm-loader.mjs tests/wasm-decrypt-smoke.mjs && node tests/catalog-smoke.mjs && node --experimental-loader=./tests/wasm-loader.mjs tests/lyrics-route.mjs && node --experimental-loader=./tests/wasm-loader.mjs tests/playback-smoke.mjs && node --experimental-loader=./tests/wasm-loader.mjs tests/playback-integration.mjs && node --experimental-loader=./tests/wasm-loader.mjs tests/playback-route.mjs && node --experimental-loader=./tests/wasm-loader.mjs tests/quality-reporting.mjs"
   },
   "devDependencies": {
     "wrangler": "^4.0.0"

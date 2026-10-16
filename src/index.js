@@ -3,7 +3,7 @@ import { createPlaybackToken, makeHlsTimestampTag, playbackResponse, reportListe
 import {
   getAlbum, getAlbumTracks, getArtist, getArtistAlbums, getArtistTop, getRelatedArtists,
   getPlaylist, getPlaylistTracks, getTrack, getTrackRadio, mapAlbum, mapAlbumSummary,
-  mapArtist, mapPlaylist, mapTrack, pagination, pipeGetAlbum, pipeGetArtist, rest, safeHttpsUrl, searchPipe, searchRest, version,
+  mapArtist, mapPlaylist, mapTrack, pagination, pipeGetAlbum, pipeGetArtist, pipeGetTrackLyrics, pipeGetTrackQualities, rest, safeHttpsUrl, searchPipe, searchRest, version,
 } from "./deezer.js";
 
 const CORS = {
@@ -55,7 +55,7 @@ export default {
       if (route === "/cover") return await cover(url);
       if (route === "/artist") return await artist(url, env);
       if (route === "/artist/similar") return await similarArtists(url);
-      if (route === "/lyrics") return fail(501, "LYRICS_NOT_EXPOSED", "Deezer's public catalog API does not provide a supported lyrics endpoint. This rebuild deliberately does not proxy full copyrighted lyrics.", requestId);
+      if (route === "/lyrics") return await lyrics(url, env, requestId);
       return fail(404, "ROUTE_NOT_FOUND", "This route is not part of the Deezer rebuild. Tidal-only Widevine and video routes are intentionally excluded.", requestId);
     } catch (error) {
       const status = Number.isInteger(error?.status) ? error.status : 502;
@@ -73,6 +73,42 @@ async function trackInfo(url) {
   const id = requiredId(url);
   const t = await getTrack(id);
   return json({ version: version(), data: mapTrack(t) });
+}
+
+async function lyrics(url, env, requestId) {
+  const id = requiredId(url);
+  const format = String(url.searchParams.get("type") || url.searchParams.get("format") || "all").toLowerCase();
+  if (!["all", "plain", "line", "word"].includes(format)) {
+    return fail(400, "INVALID_LYRICS_TYPE", "type must be all, plain, line, or word.", requestId);
+  }
+  if (!env?.DEEZER_ARL) {
+    return fail(503, "ARL_REQUIRED", "Set DEEZER_ARL to retrieve lyrics from Deezer Pipe GraphQL.", requestId);
+  }
+  const track = await pipeGetTrackLyrics(id, env);
+  if (!track) return fail(404, "LYRICS_NOT_FOUND", "Deezer did not return this track or its lyrics.", requestId);
+  const source = track.lyrics;
+  if (!source || (source.text == null && !Array.isArray(source.synchronizedLines) && !Array.isArray(source.synchronizedWordByWordLines))) {
+    return fail(404, "LYRICS_NOT_FOUND", "Deezer has no lyrics available for this track in the authenticated session's region.", requestId);
+  }
+  const plain = typeof source.text === "string" ? source.text : null;
+  const lines = Array.isArray(source.synchronizedLines) ? source.synchronizedLines : null;
+  const words = Array.isArray(source.synchronizedWordByWordLines) ? source.synchronizedWordByWordLines : null;
+  const data = {
+    trackId: numericId(track.id ?? id),
+    title: track.title || "",
+    duration: numericId(track.duration ?? 0),
+    type: format,
+    availableTypes: [ ...(plain !== null ? ["plain"] : []), ...(lines?.length ? ["line"] : []), ...(words?.length ? ["word"] : []) ],
+    ...(source.writers != null ? { writers: source.writers } : {}),
+    ...(source.copyright != null ? { copyright: source.copyright } : {}),
+    ...(source.licence != null ? { licence: source.licence } : {}),
+    ...(format === "all" || format === "plain" ? { plain } : {}),
+    ...(format === "all" || format === "line" ? { synchronizedLines: lines } : {}),
+    ...(format === "all" || format === "word" ? { synchronizedWordByWordLines: words } : {}),
+  };
+  const requestedAvailable = format === "all" || (format === "plain" && plain !== null) || (format === "line" && Boolean(lines?.length)) || (format === "word" && Boolean(words?.length));
+  if (!requestedAvailable) return fail(404, "LYRICS_FORMAT_UNAVAILABLE", `Deezer does not have ${format} lyrics for this track.`, requestId);
+  return json({ version: version(), data });
 }
 
 async function trackManifestLegacy(url, env) {
@@ -295,7 +331,8 @@ async function search(url, env) {
       const results = pipe?.search?.results;
       if (results) {
         const branch = ({ s: results.tracks, a: results.artists, al: results.albums, p: results.playlists })[key];
-        const nodes = edges(branch).map(n => mapPipeSearchItem(key, n));
+        const pipeNodes = edges(branch);
+        const nodes = pipeNodes.map(n => mapPipeSearchItem(key, n));
         const dataKey = ({ a: "artists", al: "albums", p: "playlists" })[key];
         const payload = { limit, offset, totalNumberOfItems: Number(countResponse?.total ?? nodes.length), items: nodes };
         return json({ version: version(), data: dataKey ? { [dataKey]: payload } : payload });
@@ -311,9 +348,49 @@ async function search(url, env) {
     list = list.filter(x => String(x.isrc || "").toUpperCase() === target);
   }
   const mapped = list.map(item => key === "a" ? mapArtist(item) : key === "al" ? mapAlbumSummary(item) : key === "p" ? mapPlaylist(item) : mapTrack(item));
+  if (key === "s" || key === "i") {
+    if (env?.DEEZER_ARL && mapped.length) {
+      try {
+        const qualities = await pipeGetTrackQualities(mapped.map(item => item.id), env);
+        for (const item of mapped) item.quality = mapQualityReport(qualities[String(item.id)], { previewAvailable: Boolean(item.preview) });
+      } catch (_) {
+        for (const item of mapped) item.quality = { status: "UNKNOWN", predictedQuality: null, formats: [], source: "PIPE_GRAPHQL", mediaUrlGenerated: false, reason: "Quality metadata could not be retrieved; search results are unaffected." };
+      }
+    } else {
+      for (const item of mapped) item.quality = { status: "AUTH_REQUIRED", predictedQuality: null, formats: [], source: "PIPE_GRAPHQL", mediaUrlGenerated: false, reason: "Configure DEEZER_ARL to report account-specific full-track quality." };
+    }
+  }
   const dataKey = ({ a: "artists", al: "albums", p: "playlists" })[key];
   const payload = { limit: Math.min(100, limit), offset, totalNumberOfItems: key === "i" ? mapped.length : Number(found.total ?? mapped.length), items: mapped };
   return json({ version: version(), data: dataKey ? { [dataKey]: payload } : payload });
+}
+
+function mapQualityReport(media, options = {}) {
+  if (!media) return {
+    status: options.previewAvailable ? "PREVIEW_ONLY" : "UNKNOWN",
+    predictedQuality: options.previewAvailable ? "PREVIEW" : null,
+    formats: [], source: "PIPE_GRAPHQL", mediaUrlGenerated: false,
+    reason: "Pipe did not return format metadata for this track.",
+  };
+  const sizes = media.estimatedSizes || {};
+  const full = media?.rights?.user?.full?.available;
+  const subscription = media?.rights?.sub?.available;
+  const rightsDenied = full === false && subscription === false;
+  const candidates = [
+    { format: "FLAC", size: Number(sizes.FLAC || 0), audioQuality: "LOSSLESS" },
+    { format: "MP3_320", size: Number(sizes.MP3_320 || 0), audioQuality: "HIGH" },
+    { format: "MP3_128", size: Number(sizes.MP3_128 || 0), audioQuality: "STANDARD" },
+  ].filter(item => Number.isFinite(item.size) && item.size > 0);
+  const best = rightsDenied ? null : candidates[0] || null;
+  return {
+    status: best ? "AVAILABLE" : rightsDenied ? "NOT_ENTITLED" : "UNKNOWN",
+    predictedQuality: best?.audioQuality || (options.previewAvailable ? "PREVIEW" : null),
+    bestFormat: best?.format || (options.previewAvailable ? "MP3_PREVIEW" : null),
+    formats: candidates.map(item => ({ format: item.format, audioQuality: item.audioQuality, estimatedSizeBytes: item.size })),
+    rights: { full: typeof full === "boolean" ? full : null, subscription: typeof subscription === "boolean" ? subscription : null },
+    source: "PIPE_GRAPHQL", mediaUrlGenerated: false,
+    reason: "Prediction uses current Pipe format-size and rights metadata; final media resolution can still fail.",
+  };
 }
 
 function mapPipeSearchItem(key, n) {
@@ -326,6 +403,7 @@ function mapPipeSearchItem(key, n) {
   const arts = edges(n.contributors).map(e => e.node || e).filter(a => a?.id != null).map(a => ({ id: numericId(a.id), name: a.name || "" }));
   if (key === "s") return {
     id: numericId(n.id), title: n.title || "", duration: Number(n.duration || 0), explicit: Boolean(n.isExplicit),
+    quality: mapQualityReport(n.media),
     url: `https://www.deezer.com/track/${encodeURIComponent(n.id)}`,
     ...(arts.length ? { artist: arts[0], artists: arts } : {}),
     ...(n.album ? { album: { id: numericId(n.album.id), title: n.album.displayTitle || "", cover: urlOf(n.album.cover?.urls), url: `https://www.deezer.com/album/${encodeURIComponent(n.album.id)}` } } : {}),
