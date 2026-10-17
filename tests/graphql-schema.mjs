@@ -4,14 +4,23 @@ import { buildGraphQLSchema, queryComplexityRule } from "../src/graphql.js";
 
 const resolver = async (name, args) => {
   if (name === "apiInfo") return {
-    name: "Deezer Graph API", version: "3.2.0", endpoint: "/graphql", methods: ["GET", "POST"],
+    name: "Deezer Graph API", version: "3.2.1", endpoint: "/graphql", methods: ["GET", "POST"],
     queryTransport: "GET /graphql?query=...&variables=...", mutationTransport: "POST /graphql", features: ["graphql-introspection"],
   };
-  if (name === "search") return {
-    query: args.query ?? args.q ?? args.term, type: args.type || "TRACK", limit: args.limit || 25, offset: args.offset || 0,
-    totalNumberOfItems: 1,
-    items: [{ id: "12", title: "Example Track", duration: 199, preview: "https://cdn.example.test/preview.mp3", artist: { id: "7", name: "Example Artist" }, album: { id: "4", title: "Example Album", cover: null } }],
-  };
+  if (name === "search") {
+    const items = args.query === "mixed"
+      ? [
+          { id: "21", type: "track", title: "Track by discriminator", duration: 180, preview: "https://cdn.example.test/track.mp3" },
+          { id: "22", name: "Artist by shape", picture: "https://cdn.example.test/artist.jpg" },
+          { id: "23", title: "Album by shape", cover: "https://cdn.example.test/album.jpg", releaseDate: "2024-01-01" },
+          { id: "24", title: "Playlist by shape", numberOfTracks: 18, duration: 600, image: "https://cdn.example.test/playlist.jpg" },
+        ]
+      : [{ id: "12", title: "Example Track", duration: 199, preview: "https://cdn.example.test/preview.mp3", artist: { id: "7", name: "Example Artist" }, album: { id: "4", title: "Example Album", cover: null } }];
+    return {
+      query: args.query ?? args.q ?? args.term, type: args.type || "TRACK", limit: args.limit || 25, offset: args.offset || 0,
+      totalNumberOfItems: items.length, items,
+    };
+  }
   return null;
 };
 const schema = buildGraphQLSchema();
@@ -43,6 +52,31 @@ assert.equal(result.errors, undefined, JSON.stringify(result.errors));
 assert.equal(result.data.results.items[0].id, "12");
 assert.equal(result.data.results.items[0].artist.name, "Example Artist");
 assert.equal("preview" in result.data.results.items[0], false, "@include should honour its variable default");
+
+const mixedDocument = parse(`{
+  search(query: "mixed") {
+    items {
+      __typename id title name duration
+      ... on Track { preview }
+      ... on Artist { picture }
+      ... on AlbumSummary { cover releaseDate }
+      ... on Playlist { numberOfTracks image }
+    }
+  }
+}`);
+const mixedResult = await execute({
+  schema,
+  document: mixedDocument,
+  contextValue: { env: {}, origin: "https://worker.test", resolveQueryField: resolver, resolveMutationField: resolver },
+});
+assert.equal(mixedResult.errors, undefined, JSON.stringify(mixedResult.errors));
+assert.deepEqual(
+  mixedResult.data.search.items.map(item => item.__typename),
+  ["Track", "Artist", "AlbumSummary", "Playlist"],
+  "SearchItem.resolveType must return concrete GraphQL type-name strings for every supported item kind",
+);
+assert.equal(mixedResult.data.search.items[2].cover, "https://cdn.example.test/album.jpg");
+assert.equal(mixedResult.data.search.items[3].numberOfTracks, 18);
 
 const multi = parse("query First { apiInfo { name } } query Second { __typename }");
 assert.equal(getOperationAST(multi, "Second").name.value, "Second", "named operation selection should work");

@@ -112,6 +112,64 @@ const MediaMetadataType = new GraphQLObjectType({
   fields: { tags: { type: listOf(GraphQLString) } },
 });
 
+// GraphQL.js calls an abstract type's `resolveType` function (resolver-map
+// integrations usually name the same hook `__resolveType`). GraphQL.js expects
+// the concrete GraphQL type *name* as a string, not a GraphQLObjectType instance.
+function resolveSearchItemType(value) {
+  if (!value || typeof value !== "object") return null;
+
+  const normalize = input => String(input).trim().replace(/[\s_-]/g, "").toUpperCase();
+  const aliases = {
+    TRACK: "Track",
+    SONG: "Track",
+    ARTIST: "Artist",
+    ALBUM: "AlbumSummary",
+    ALBUMSUMMARY: "AlbumSummary",
+    PLAYLIST: "Playlist",
+  };
+
+  // Prefer explicit discriminators when the source API provides one.
+  for (const key of ["__typename", "__type", "itemType", "item_type", "objectType", "kind", "type"]) {
+    if (typeof value[key] !== "string" || !value[key].trim()) continue;
+    const discriminator = normalize(value[key]);
+    if (["TRACK", "ARTIST", "ALBUMSUMMARY", "PLAYLIST"].includes(discriminator)) {
+      return discriminator === "ALBUMSUMMARY" ? "AlbumSummary" : discriminator[0] + discriminator.slice(1).toLowerCase();
+    }
+    if (aliases[discriminator]) return aliases[discriminator];
+  }
+
+  const hasValue = key => value[key] !== undefined && value[key] !== null;
+
+  // Playlists can also have title/duration fields, so test their unique fields
+  // before the more general track/album checks. numberOfVolumes distinguishes
+  // Pipe album objects from playlist objects that also expose numberOfTracks.
+  if (
+    hasValue("image") || hasValue("creator") || hasValue("publicPlaylist") ||
+    hasValue("created") || hasValue("estimatedTracksCount") ||
+    (hasValue("numberOfTracks") && !hasValue("numberOfVolumes") && !hasValue("upc") && !hasValue("cover"))
+  ) return "Playlist";
+
+  if (hasValue("name") && !hasValue("title")) return "Artist";
+
+  // These fields identify tracks reliably across both REST and Pipe mappings.
+  if (
+    hasValue("isrc") || hasValue("preview") || hasValue("trackNumber") ||
+    hasValue("volumeNumber") || hasValue("album") || hasValue("audioQuality") ||
+    hasValue("mediaMetadata") || hasValue("streamReady") || hasValue("allowStreaming")
+  ) return "Track";
+
+  if (
+    hasValue("numberOfVolumes") || hasValue("releaseDate") || hasValue("upc") ||
+    hasValue("record_type") || (hasValue("title") && hasValue("cover"))
+  ) return "AlbumSummary";
+
+  // Duration is the final useful heuristic when an object has no discriminator.
+  // A title-only item defaults to Track to preserve the previous fallback behavior.
+  if (hasValue("title") && hasValue("duration")) return "Track";
+  if (hasValue("title")) return Object.prototype.hasOwnProperty.call(value, "cover") ? "AlbumSummary" : "Track";
+  return null;
+}
+
 // Shared interface keeps common fields directly selectable from search results,
 // while concrete object types expose their category-specific metadata.
 const SearchItemType = new GraphQLInterfaceType({
@@ -124,12 +182,7 @@ const SearchItemType = new GraphQLInterfaceType({
     duration: { type: GraphQLInt },
     quality: { type: QualityReportType },
   },
-  resolveType(value) {
-    if (value && (value.numberOfTracks != null || value.image != null)) return PlaylistType;
-    if (value && value.name != null && value.title == null) return ArtistType;
-    if (value && value.title != null && value.duration == null) return AlbumSummaryType;
-    return TrackType;
-  },
+  resolveType: resolveSearchItemType,
 });
 
 const CreatorType = new GraphQLObjectType({
