@@ -1,7 +1,7 @@
 const REST = "https://api.deezer.com";
 const PIPE = "https://pipe.deezer.com/api";
 const AUTH = "https://auth.deezer.com/login/arl";
-const APP_VERSION = "3.0.0";
+const APP_VERSION = "3.2.0";
 
 let jwt = "";
 let jwtExpiresAt = 0;
@@ -143,18 +143,6 @@ export async function searchPipe(q, limit, env) {
 }
 
 
-export async function pipeGetTrackQualities(trackIds, env) {
-  const ids = [...new Set((trackIds || []).map(String).filter(id => /^\d+$/.test(id)))].slice(0, 100);
-  if (!ids.length) return {};
-  const declarations = ids.map((_, i) => `$id${i}: String!`).join(", ");
-  const selections = ids.map((_, i) => `t${i}: track(trackId: $id${i}) { id media { estimatedSizes { MP3_128 MP3_320 FLAC } rights { user { full { available } } sub { available } } } }`).join("\n");
-  const variables = Object.fromEntries(ids.map((id, i) => [`id${i}`, id]));
-  const data = await pipeQuery(`query DeezerTrackQuality(${declarations}) { ${selections} }`, variables, env);
-  const result = {};
-  ids.forEach((id, i) => { const track = data?.[`t${i}`]; if (track?.id != null) result[String(track.id)] = track.media || null; });
-  return result;
-}
-
 export async function pipeGetTrackLyrics(id, env) {
   const trackId = String(id ?? "");
   if (!/^\d+$/.test(trackId)) throw Object.assign(new Error("id must be a numeric Deezer catalog identifier"), { status: 400 });
@@ -170,6 +158,18 @@ export async function pipeGetTrackLyrics(id, env) {
   }`;
   const data = await pipeQuery(query, { trackId }, env);
   return data?.track ?? null;
+}
+
+export async function pipeGetTrackQualities(trackIds, env) {
+  const ids = [...new Set((trackIds || []).map(String).filter(id => /^\d+$/.test(id)))].slice(0, 100);
+  if (!ids.length) return {};
+  const declarations = ids.map((_, i) => `$id${i}: String!`).join(", ");
+  const selections = ids.map((_, i) => `t${i}: track(trackId: $id${i}) { id media { estimatedSizes { MP3_128 MP3_320 FLAC } rights { user { full { available } } sub { available } } } }`).join("\n");
+  const variables = Object.fromEntries(ids.map((id, i) => [`id${i}`, id]));
+  const data = await pipeQuery(`query DeezerTrackQuality(${declarations}) { ${selections} }`, variables, env);
+  const result = {};
+  ids.forEach((id, i) => { const track = data?.[`t${i}`]; if (track?.id != null) result[String(track.id)] = track.media || null; });
+  return result;
 }
 
 export async function getTrack(id) { return rest(`track/${encodeURIComponent(String(id))}`); }

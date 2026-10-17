@@ -1,13 +1,16 @@
 {
-  "name": "deezer-hifi-api-rebuild",
-  "version": "3.0.0",
+  "name": "deezer-graph-api",
+  "version": "3.2.0",
   "private": true,
   "type": "module",
   "scripts": {
-    "check": "node --check src/index.js && node --check src/deezer.js && node --check src/wasm-match.js && node --check src/wasm-decrypt.js && node --check src/playback.js",
+    "check": "node --check src/index.js && node --check src/graphql.js && node --check src/deezer.js && node --check src/wasm-match.js && node --check src/wasm-decrypt.js && node --check src/playback.js",
     "deploy": "wrangler deploy",
     "dev": "wrangler dev",
-    "test": "npm run check && node tests/wasm-smoke.mjs && node --experimental-loader=./tests/wasm-loader.mjs tests/wasm-decrypt-smoke.mjs && node tests/catalog-smoke.mjs && node --experimental-loader=./tests/wasm-loader.mjs tests/lyrics-route.mjs && node --experimental-loader=./tests/wasm-loader.mjs tests/playback-smoke.mjs && node --experimental-loader=./tests/wasm-loader.mjs tests/playback-integration.mjs && node --experimental-loader=./tests/wasm-loader.mjs tests/playback-route.mjs && node --experimental-loader=./tests/wasm-loader.mjs tests/quality-reporting.mjs"
+    "test": "npm run check && node tests/wasm-smoke.mjs && node --experimental-loader=./tests/wasm-loader.mjs tests/wasm-decrypt-smoke.mjs && node tests/catalog-smoke.mjs && node --experimental-loader=./tests/wasm-loader.mjs tests/playback-smoke.mjs && node --experimental-loader=./tests/wasm-loader.mjs tests/playback-integration.mjs && node --experimental-loader=./tests/wasm-loader.mjs tests/playback-route.mjs && node --experimental-loader=./tests/wasm-loader.mjs tests/quality-reporting.mjs && node tests/graphql-schema.mjs && node --experimental-loader=./tests/wasm-loader.mjs tests/graphql-route.mjs && node --experimental-loader=./tests/wasm-loader.mjs tests/lyrics-route.mjs"
+  },
+  "dependencies": {
+    "graphql": "^17.0.2"
   },
   "devDependencies": {
     "wrangler": "^4.0.0"

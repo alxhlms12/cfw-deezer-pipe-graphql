@@ -1,166 +1,156 @@
-# Deezer HiFi API rebuild
+# Deezer Graph API
 
-Cloudflare Worker implementation with a Tidal `hifi-api`-style response envelope and route naming where Deezer has an honest equivalent. This is a clean implementation; it does not import or modify the previous Deezer Worker.
+Cloudflare Worker providing a typed GraphQL API backed by Deezer's catalog and playback services. The `/graphql` endpoint uses **GraphQL.js**, the reference implementation for JavaScript, for document parsing, standards-based validation, variable coercion, execution, introspection, fragments, directives, and operation selection. This replaces the previous home-grown GraphQL-like parser.
 
-## Scope at a glance
+## How close is it to real GraphQL?
 
-- Catalog requests stay separate from media resolution. Search, artist, album, and playlist routes do not fetch or decrypt audio.
-- Public Deezer REST API is the fallback source for catalog lookups. If `DEEZER_ARL` is configured, page-zero catalog searches use Pipe GraphQL first and fall back to REST if Pipe fails. Pipe is unofficial and may change without notice.
-- Catalog routes do not resolve audio. `GET /track` and `GET /trackManifests` use the official 30-second preview when `quality=PREVIEW` is requested or no ARL is configured; with a server-side `DEEZER_ARL`, they can resolve an account-entitled full-track format.
-- Full audio is served through `GET /track?id=...&playback=1&quality=...&pt=...`; this is deliberately not a separate `/stream` route. The short-lived signed `pt` token binds playback to one track and format, and the Worker fetches only HTTPS Deezer media hosts.
-- `POST /track?log=listen` sends best-effort start/30-second listen events to Deezer's undocumented `log.listen` gateway method. The `start` event returns a refreshed signed `playToken` containing the listening start time; use that token for the 30-second event. This is an unofficial gateway protocol, so an accepted HTTP response is not proof of royalties, play-count, or listening-history credit.
-- Full-track metadata/token and media-service license-token lookup use Deezer Pipe GraphQL (`track.media.token` and `tokens.mediaServiceLicenseToken`); the Worker then asks Deezer's media service for an authorized source. This avoids `song.getListData` and `song.getData`. The private media endpoint and decryption format are undocumented and may change; the Worker checks returned media rights/format sizes before requesting a format. No arbitrary URL proxy or Widevine route is included.
-- Catalog responses are not cached; all responses have `Cache-Control: no-store` for repeatable testing. Only the short-lived Pipe JWT is held in module memory for auth efficiency.
-- The project includes two compiled WASM modules: bounded Levenshtein distance for `/cover?q=` matching and the Blowfish stripe transform used by the authenticated progressive/HLS MP3 playback path. The MD5-derived track-key setup remains in JavaScript; the per-stripe decryption transform runs in WASM.
+The **GraphQL language, schema validation, and execution layer now use the real GraphQL.js implementation**, rather than approximating the syntax and projection behavior in custom code. This enables standard operations, variables, aliases, fragments, built-in directives such as `@skip` and `@include`, multiple operations selected with `operationName`, schema introspection, typed arguments/enums, nested selection validation, standard field execution, and standard GraphQL error locations and paths.
 
-## Deploy
+The service is not a complete implementation of every possible GraphQL-over-HTTP deployment feature: it supports HTTP queries and mutations, but not subscription transport, multipart upload, incremental delivery (`@defer`/`@stream`), or persisted-query extensions. Those are transport/server features beyond ordinary GraphQL query and mutation execution. A query complexity guard limits documents to 32,768 characters, 1,000 fields, and a selection depth of 20. The service uses GraphQL.js v17, the current reference implementation release line.
 
-1. Install Node.js 20+.
-2. From this folder run `npm install`.
+## Features
+
+- Catalog search and metadata through typed GraphQL fields: tracks, artists, albums, playlists, mixes, recommendations, artwork, artist relationships, and lyrics.
+- Account-specific quality prediction through Deezer Pipe GraphQL when `DEEZER_ARL` is configured.
+- Preview or full-track progressive playback manifests, HLS manifests, and signed media delivery URLs. MPEG-DASH and download usage are recognized by the API but are currently reported as unsupported by the adapter.
+- Optional playback reporting through the `reportPlayback` mutation. Deezer's `log.listen` protocol is undocumented, so an accepted response is not proof of listening-history or royalty credit.
+- Legacy module-specific routes, fields, client helpers, settings, and tests have been removed; the API surface is GraphQL-first.
+- Responses are not cached; `Cache-Control: no-store` is retained for repeatable testing. A per-isolate rate limiter is best-effort; use Cloudflare-level rate limiting for production.
+
+## Install and deploy
+
+1. Use Node.js 22 or newer (required by GraphQL.js v17).
+2. Run `npm install` to install `graphql` and Wrangler.
 3. Run `npm run check` and `npm test`.
-4. Add the Deezer ARL as a Cloudflare Worker secret:
+4. Add the Deezer ARL as a Cloudflare Worker secret when authenticated Pipe catalog metadata and full-track playback are needed:
 
    ```sh
    npx wrangler secret put DEEZER_ARL
    ```
 
-5. Add a long random API key as a second secret:
+5. Add a long random API key as a second Cloudflare Worker secret:
 
    ```sh
    npx wrangler secret put API_KEY
    ```
 
-   Use `Authorization: Bearer <API_KEY>` or `X-API-Key: <API_KEY>` when requesting manifests/catalog routes. The generated signed audio URL and listen-reporting requests don't need the long-lived key header, but their signed token expires after 30 minutes. Do not put the ARL or the long-lived API key in public frontend code, logs, or a public repository.
+   Use `Authorization: Bearer <API_KEY>` or `X-API-Key: <API_KEY>` for GraphQL requests when `API_KEY` is configured. The long-lived key and ARL must not be placed in public frontend code. Signed media URLs use a short-lived signed token and expire after 30 minutes.
 
-6. Run locally using `npm run dev`, or deploy with `npm run deploy`.
+6. Run `npm run dev` locally or deploy with `npm run deploy`.
 
-`DEEZER_ARL` and `API_KEY` are both required for full-track playback. Catalog-only use without those secrets still works through the public REST API. The Worker applies a best-effort per-isolate limit of 120 requests per IP per minute; use Cloudflare-level rate limiting for durable distributed limits on public deployments.
+Both secrets are required for authenticated full-track playback. Catalog-only search continues to use Deezer's public REST API without the secrets; if `DEEZER_ARL` is set, eligible catalog lookups use Pipe GraphQL first and fall back to REST if Pipe fails. Pipe and the underlying media service are unofficial/undocumented dependencies and can change without notice.
 
-## Routes
+## HTTP transport
 
-Routes are `GET` except `POST /track?log=listen` and `OPTIONS` CORS preflight. Query parameters are validated; errors use `{ "version": "3.0.0", "error": { "code", "message", "requestId" } }`. Responses are not cached.
+### GET query
 
-| Route | Query | Upstream / behavior | Response shape |
-|---|---|---|---|
-| `/` | none | Local service info | `{version, Repo}` |
-| `/info` | `id` | Deezer `track/{id}` | `{version, data}`; maps supported track fields and marks preview availability honestly |
-| `/track` | `id`; optional `quality`; internal signed playback URL uses `playback=1&pt=...` | Deezer preview API or Pipe GraphQL `track.media.token` + `tokens.mediaServiceLicenseToken` → `media.deezer.com/v1/get_url` → Deezer CDN | Tidal-style manifest wrapper for preview/full format; with `playback=1`, returns decrypted audio bytes and supports single byte ranges |
-| `/trackManifests` | `id`; optional `formats`, `quality`, `uriScheme` | Deezer preview API or authenticated media resolver | Tidal v2.7-style manifest wrapper with preview/progressive full-audio URLs; `manifestType=HLS` returns a single packed-MP3 VOD playlist and short-lived signed segment URL. MPEG-DASH is explicitly unsupported. |
-| `POST /track?log=listen` | JSON body `{trackId, playToken, event}` where `event` is `start` or `30` | Deezer internal `gw-light.php` `log.listen` method | Best-effort telemetry result; the `start` response returns an updated `playToken` for the 30-second event |
-| `/recommendations` | `id`; optional `limit`, `offset` | Deezer `track/{id}/radio` | `{version,data:{limit,offset,totalNumberOfItems,items:[{track,sources}]}}` |
-| `/search` | exactly one of `s`, `a`, `al`, `p`, `i`; optional `limit`, `offset` | Pipe GraphQL on first page when configured; REST fallback | track results under `data`; track items include `quality` predictions when Pipe media metadata is available; artist, album, playlist results nested under `data.artists`, `data.albums`, `data.playlists` |
-| `/album` | `id`; optional `limit`, `offset` | Deezer `album/{id}` and `album/{id}/tracks` in parallel | `{version,data:{...album,numberOfTracks,items,pagination}}` |
-| `/mix` | `id` (Deezer track ID); optional `limit`, `offset` | Deezer `track/{id}` and `track/{id}/radio` in parallel | `{version,mix,items,pagination}`; interpreted as track radio, not a Tidal mix token |
-| `/playlist` | `id`; optional `limit`, `offset` | Deezer `playlist/{id}` and `playlist/{id}/tracks` in parallel | `{version,playlist:{...playlist,items,pagination}}` |
-| `/cover` | either `id` (track ID) or `q` | Deezer track/track search; WASM assists best-match title scoring | `{version,covers:[{id,name,small,medium,large,xl}]}` |
-| `/artist` | either `id` or `f`; `skip_tracks`, `limit`, `offset` for `f` | Deezer artist, albums, top tracks, album tracklists | `{version,artist,cover}` for `id`; `{version,albums,tracks}` for `f` |
-| `/artist/similar` | `id`; optional `limit`, `offset` | Deezer `artist/{id}/related` | `{version,data:{artist,items,limit,offset,totalNumberOfItems}}` |
-| `/lyrics` | `id`; optional `type=all\|plain\|line\|word` (or `format`) | Authenticated Deezer Pipe GraphQL | `{version,data:{trackId,title,duration,type,availableTypes,...}}`; returns plain text, line-synced entries, word-level timing, or all available forms |
+Use a URL-encoded GraphQL document in `query`. Optional `variables`, `extensions`, and `operationName` parameters are JSON/text URL parameters. GET is for read-only queries; mutations receive HTTP 405 on GET.
 
-`/lyrics` uses Deezer Pipe GraphQL with the server-side `DEEZER_ARL` session and supports `type=plain`, `type=line`, `type=word`, or `type=all` (default). It returns only the lyric types Deezer provides for that track and region; word timing is not available for every track. Treat lyric text and timing as rights-managed content and use it only where you have permission. `/widevine`, `/video`, `/topvideos`, and `/album/similar` remain intentionally excluded because they do not have a suitable supported Deezer catalog equivalent. The Tidal-only video-search key `v` is rejected explicitly.
+```text
+GET /graphql?query=%7B%20search(query%3A%22Ella%20Mai%22)%20%7B%20totalNumberOfItems%20items%20%7B%20id%20title%20duration%20%7D%20%7D%20%7D
+```
 
-### True quality reporting in search
+### POST query or mutation
 
-Track search results include a `quality` object. With `DEEZER_ARL` configured, the Worker requests Pipe GraphQL `media.estimatedSizes` and `media.rights` for each returned track (batched on REST-paginated pages) and predicts the highest reported format in this order: FLAC, MP3 320, MP3 128. Example:
+Send a JSON body with `query`, and optionally `variables`, `operationName`, and `extensions`:
 
-```json
-{
-  "quality": {
-    "status": "AVAILABLE",
-    "predictedQuality": "LOSSLESS",
-    "bestFormat": "FLAC",
-    "formats": [
-      { "format": "FLAC", "audioQuality": "LOSSLESS", "estimatedSizeBytes": 40000000 },
-      { "format": "MP3_320", "audioQuality": "HIGH", "estimatedSizeBytes": 10000000 },
-      { "format": "MP3_128", "audioQuality": "STANDARD", "estimatedSizeBytes": 4000000 }
-    ],
-    "rights": { "full": true, "subscription": true },
-    "source": "PIPE_GRAPHQL",
-    "mediaUrlGenerated": false
+```http
+POST /graphql
+Content-Type: application/json
+
+{"query":"query Search($term: String!) { search(query: $term) { query totalNumberOfItems items { id title duration } } }","variables":{"term":"Ella Mai"}}
+```
+
+POST follows the GraphQL-over-HTTP JSON request format (`Content-Type: application/json`). The response uses proper `Accept` content negotiation between `application/graphql-response+json` and the legacy-compatible `application/json`. Request parse failures use HTTP 400, validation and operation-selection failures use HTTP 422, GET mutations use HTTP 405, and execution errors use HTTP 200 with a GraphQL `errors` array.
+
+### Fragments and runtime type fields
+
+The `search.items` field is a typed `SearchItem` interface. Shared fields (`id`, `title`, `name`, `url`, `duration`, `quality`) can be selected directly. Type-specific fields need an inline fragment or named fragment, as in a normal GraphQL schema:
+
+```graphql
+query Search($term: String!, $showPreview: Boolean!) {
+  search(query: $term, type: TRACK) {
+    items {
+      id
+      title
+      ... on Track {
+        preview @include(if: $showPreview)
+        artist { id name }
+        album { id title cover }
+      }
+    }
   }
 }
 ```
 
-The exact values depend on Pipe's response. Without `DEEZER_ARL`, the report is `AUTH_REQUIRED`; if Pipe fails, it is `UNKNOWN` and catalog search still succeeds. This is an availability prediction, not a promise that later media resolution will succeed. It intentionally does not call the media service or generate a playback URL during search.
-
-### Search examples
+Example URL with variables and an operation name, after encoding the `query` and `variables` values:
 
 ```text
-GET /search?s=track%3A%22Get%20Lucky%22
-GET /search?a=Daft%20Punk&limit=10
-GET /search?al=Discovery&limit=20&offset=0
-GET /search?p=electronic&limit=10
-GET /search?i=USQX91400008
-GET /trackManifests?id=3135556
-GET /trackManifests?id=3135556&quality=FLAC
-GET /lyrics?id=3135556&type=plain
-GET /lyrics?id=3135556&type=line
-GET /lyrics?id=3135556&type=word
-GET /recommendations?id=3135556&limit=20
-GET /artist/similar?id=27
+/graphql?query=query%20FindTracks(%24term%3A%20String!)%20%7B%20search(query%3A%24term%2C%20type%3ATRACK)%20%7B%20items%20%7B%20id%20title%20quality%20%7B%20status%20predictedQuality%20bestFormat%20%7D%20%7D%20%7D%20%7D&variables=%7B%22term%22%3A%22Ella%20Mai%22%7D&operationName=FindTracks
 ```
 
-The track identifier examples are illustrative; a route can return `404` or a preview-unavailable error when a track is removed, region-limited, or has no preview. For full playback, `MEDIA_RESOLUTION_FAILED` includes sanitized per-format HTTP/error codes (for example, HTTP 403) so an upstream entitlement/session rejection is distinguishable from a Worker parser failure. Raw upstream response bodies and credentials are not returned.
+## Schema fields
 
+| Field | Arguments | Result |
+|---|---|---|
+| `apiInfo` | none | Name, version, supported features, transport description |
+| `search` | `query` or `q`/`term`, `type`, `limit`, `offset` | Typed search result page; default `type` is `TRACK` |
+| `track`, `trackInfo` | `id: ID!` | Track metadata and quality prediction; does not create a media URL |
+| `quality` | `id: ID!`, `includePreview` | Account-specific format-availability report |
+| `trackManifest` | `id: ID!`, `quality`, `formats`, `manifestType`, `usage`, `uriScheme` | Preview or full-playback manifest; HLS is supported; MPEG-DASH and download remain unsupported |
+| `recommendations` | `id: ID!`, `limit`, `offset` | Track-radio recommendations |
+| `album` | `id: ID!`, `limit`, `offset` | Album metadata, tracks, and pagination |
+| `mix` | `id: ID!`, `limit`, `offset` | Track-radio mix and tracks |
+| `playlist` | `id: ID!`, `limit`, `offset` | Playlist metadata, tracks, and pagination |
+| `cover`, `covers` | `id` or `query`/`q` | Artwork from a track or title search |
+| `artist` | `id: ID!` | Artist metadata |
+| `artistCatalog` | `id: ID!`, `skipTracks`, `limit`, `offset` | Artist albums and track catalog |
+| `similarArtists` | `id: ID!`, `limit`, `offset` | Related artists |
+| `lyrics` | `id: ID!`, `type` (`ALL`, `PLAIN`, `LINE`, `WORD`) | Lyrics and available synchronized forms when Deezer returns them for the configured account/region |
+| `reportPlayback` mutation | `trackId: ID!`, `playToken: String!`, `event: PlaybackEvent!` | Best-effort listen-reporting result; `event` is `START` or `THIRTY_SECONDS` |
 
-### Full-track playback and listen reporting
+`SearchType`, `TrackQuality`, `ManifestType`, `ManifestUsage`, `UriScheme`, `LyricsForm`, and `PlaybackEvent` are schema enums. Use enum values without quotes, for example `type: TRACK`, `quality: BEST`, and `type: WORD` for lyrics.
 
-With both secrets configured, request a manifest with `GET /trackManifests?id=<id>` or `GET /track?id=<id>`, authenticating that request with `Authorization: Bearer <API_KEY>`. The response contains a `playbackToken` and a signed progressive URL; the signed URL expires after 30 minutes and is bound to the requested track and format. `quality=best` tries FLAC, then MP3 320, then MP3 128 subject to account entitlement. `quality=PREVIEW` explicitly requests only the public preview. `manifestType=HLS` returns a single-file HLS VOD playlist using MP3_320 (falling back to MP3_128) because raw FLAC is not a supported HLS packed-audio segment. The playlist URI itself is signed and expires with the token. `manifestType=MPEG_DASH` remains unsupported and returns `MANIFEST_TYPE_UNSUPPORTED`; this Worker does not synthesize a DASH manifest around protected audio. Omit `manifestType` for the existing progressive response, or use `manifestType=HLS` where supported. `usage=DOWNLOAD` returns `USAGE_UNSUPPORTED`; the legacy misspelling `usgae=PLAYBACK` is accepted for compatibility.
+## More examples
 
-The Worker cannot observe whether a client actually plays audio, so the client should report the events from its media player's real playback events—not merely from a manifest request. At `playing`, POST `{ "trackId": "<id>", "playToken": "<manifest playbackToken>", "event": "start" }` to `/track?log=listen`. Save the returned updated `playToken`; once `audio.currentTime >= 30`, POST the same body with that updated token and `event: "30"`. These telemetry requests can run asynchronously and should not block playback. Use `fetch(..., {method:"POST", keepalive:true, headers:{"Content-Type":"text/plain"}, body:JSON.stringify(body)})` or a `sendBeacon` for transport. The Worker enforces that the 30-second event follows a signed start event at least 30 seconds earlier, but because Deezer's gateway and listen-count rules are undocumented, the endpoint response cannot guarantee that Deezer credited a qualifying play or royalties.
+Track manifest:
 
-This path uses private, undocumented Deezer endpoints, not a public SDK contract. Test with your own account and verify listening history in Deezer rather than treating a successful HTTP response as proof that tracking worked.
-
-## Upstream endpoint research
-
-### Public REST
-
-Base URL: `https://api.deezer.com`. The Worker uses these public catalog resources:
-
-- `GET /track/{id}`
-- `GET /album/{id}` and `GET /album/{id}/tracks?limit=&index=`
-- `GET /artist/{id}`, `GET /artist/{id}/top?limit=`, `GET /artist/{id}/albums?limit=&index=`, `GET /artist/{id}/related?limit=`
-- `GET /playlist/{id}` and `GET /playlist/{id}/tracks?limit=&index=`
-- `GET /search`, `GET /search/artist`, `GET /search/album`, `GET /search/playlist`
-- `GET /track/{id}/radio?limit=`
-
-The public REST search supports `index` rather than the Tidal README's `offset`; the Worker translates `offset` to `index`. Requested page size is capped at 100 to avoid sending unsupported, overly large REST requests. No automatic retries are performed for the catalog path; retry logic could multiply latency and upstream load.
-
-### Pipe GraphQL (optional)
-
-- Authentication: `POST https://auth.deezer.com/login/arl?jo=p&rto=c&i=c`, sending the ARL only as a server-side cookie.
-- Catalog and authenticated playback-token queries: `POST https://pipe.deezer.com/api`, with a short-lived Bearer JWT and GraphQL variables. Playback requests query `track.media.token.payload`, format sizes/rights, and `tokens.mediaServiceLicenseToken` in one operation; no `song.getListData` or `song.getData` request is made.
-- The implementation refreshes its JWT with a 30-second expiry margin and coalesces concurrent refresh requests within an isolate. It doesn't log credentials or return tokens to clients.
-- Pipe is undocumented and unofficial. Search currently uses Pipe for first-page results when configured; public REST remains a fallback for catalog routes and numeric offset pagination. Deezer's current Pipe schema has no listen-reporting mutation, so `POST /track?log=listen` still uses the legacy gateway only for `log.listen`; that endpoint cannot honestly be described as fully migrated until Deezer exposes an equivalent Pipe operation.
-
-### Response contract decisions
-
-The Tidal README is the compatibility reference for route names, wrappers, pagination keys, and `trackManifests` nesting. Deezer fields are mapped where their meaning is comparable. Full media resolution is isolated to `/track` and `/trackManifests` requests; ordinary search and metadata requests never fetch or decrypt audio. Preview manifests say `PREVIEW` and return `MP3_PREVIEW`; if a track has no official preview URL, the route returns `404` instead of manufacturing a preview URL.
-
-## WASM layout
-
-```text
-wasm/match.wasm          compiled bounded string-distance helper
-src/match.c              source for the string-distance helper
-src/wasm-match.js        Worker wrapper with JavaScript fallback
-wasm/decrypt.wasm        compiled Blowfish stripe transform
-src/decrypt.c            source for the Blowfish transform
-src/wasm-decrypt.js      key setup, per-track cipher cache, batched WASM calls
+```graphql
+query Manifest($id: ID!) {
+  trackManifest(id: $id, quality: BEST, manifestType: PROGRESSIVE) {
+    id trackPresentation uri manifestMimeType formats audioQuality streamUrl
+  }
+}
 ```
 
-The `CompiledWasm` rule in `wrangler.toml` is required so Wrangler bundles the modules correctly. The decryption wrapper caches up to 64 initialized ciphers per isolate and batches selected encrypted stripes to reduce JavaScript/WASM boundary crossings. Tests compare the WASM output with three single-stripe and two aligned-buffer reference vectors, including a multi-batch buffer. Local synthetic-buffer benchmarks show performance close to the previous JavaScript path; WASM is not guaranteed to be faster on every runtime or chunk size. Playback tests mock Deezer authentication, media resolution, CDN responses, byte-range playback, single-file HLS output, and listen events; mocks do not prove live Deezer access or royalty credit.
+Lyrics, when provided by Pipe for the current authenticated session/region:
 
-## Sources checked
+```graphql
+query Lyrics($id: ID!) {
+  lyrics(id: $id, type: WORD) {
+    trackId title synchronizedWordByWordLines {
+      start end words { start end word }
+    }
+  }
+}
+```
 
-- [Deezer developer API](https://developers.deezer.com/api)
-- [Deezer public API endpoint index](https://apis.io/apis/deezer/platform/)
-- [Pipe GraphQL current client authentication flow](https://github.com/music-assistant/deezer-python-gql/blob/main/deezer_python_gql/base_client.py)
-- [Pipe GraphQL search query schema](https://github.com/music-assistant/deezer-python-gql/blob/main/queries/search.graphql)
-- [Pipe GraphQL track query schema](https://github.com/music-assistant/deezer-python-gql/blob/main/queries/get_track.graphql)
-- [Deezer Python client route methods](https://deezer-python.readthedocs.io/en/v7.0.0/api_reference/client.html)
-- [OpenDeezer private media-resolution and authenticated playback overview](https://github.com/Cycl0o0/OpenDeezer)
-- [Pipe GraphQL schema: track media token and rights](https://github.com/music-assistant/deezer-python-gql/blob/main/queries/get_track.graphql)
-- [Pipe GraphQL schema: media-service license token](https://github.com/music-assistant/deezer-python-gql/blob/main/schema.graphql)
-- [Observed `log.listen` request structure](https://gist.github.com/TavoElgueaLopez/d15827f246b27cf3130e77b5468fe434)
+Playback reporting is a mutation and therefore must use POST:
 
-Pipe field names and authentication behavior were checked against the current public source on 2026-10-15. Because Pipe is not a stable public API, deploy-time/live behavior still needs verification with the target Deezer account.
+```graphql
+mutation Report($id: ID!, $token: String!, $event: PlaybackEvent!) {
+  reportPlayback(trackId: $id, playToken: $token, event: $event) {
+    accepted duplicate event playToken
+  }
+}
+```
+
+GraphQL introspection is enabled through the standard `__schema` and `__type` fields. All old catalog REST routes such as `/search`, `/album`, `/trackManifests`, and `/artist/similar` return `404 ROUTE_MOVED_TO_GRAPHQL`. `/delivery/audio` and `/delivery/manifest` are signed internal media transports returned through playback manifests, not catalog endpoints.
+
+## Quality reporting
+
+Track search items may include a `quality` object. With `DEEZER_ARL` configured, the Worker requests Pipe GraphQL `media.estimatedSizes` and `media.rights` and predicts the highest reported format in this order: FLAC, MP3 320, MP3 128. The exact response depends on Pipe. Without `DEEZER_ARL`, the report is `AUTH_REQUIRED`; if Pipe fails, it is `UNKNOWN`. This is an availability prediction, not a guarantee that later media resolution will succeed.
+
+## Playback notes
+
+The `trackManifest` field returns the official 30-second preview when `quality: PREVIEW` is requested or the Worker has no authenticated ARL. With a configured ARL, it may resolve a format that the account can play. Full audio is delivered through a signed `/delivery/audio` URL; the short-lived `pt` token binds playback to a track and format. The Worker fetches only approved HTTPS Deezer media hosts. The Blowfish stripe transform runs in WASM; media token negotiation and decryption formats are undocumented and can change.

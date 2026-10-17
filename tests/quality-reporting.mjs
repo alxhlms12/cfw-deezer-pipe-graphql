@@ -34,12 +34,16 @@ globalThis.fetch = async (input, init = {}) => {
 };
 
 try {
-  const response = await worker.fetch(new Request("https://worker.test/search?s=Test%20Track", {
+  const query = `query Search($query: String!) { search(query: $query, type: TRACK) { totalNumberOfItems items { id title quality { status predictedQuality bestFormat formats { format audioQuality estimatedSizeBytes } mediaUrlGenerated } } } }`;
+  const url = new URL("https://worker.test/graphql");
+  url.searchParams.set("query", query);
+  url.searchParams.set("variables", JSON.stringify({ query: "Test Track" }));
+  const response = await worker.fetch(new Request(url.toString(), {
     headers: { "X-API-Key": "test-key" },
   }), { API_KEY: "test-key", DEEZER_ARL: "test-arl" });
   assert.equal(response.status, 200);
   const body = await response.json();
-  const track = body.data.items[0];
+  const track = body.data.search.items[0];
   assert.equal(track.id, 472400862);
   assert.equal(track.quality.status, "AVAILABLE");
   assert.equal(track.quality.predictedQuality, "LOSSLESS");

@@ -3,7 +3,7 @@ import { createPlaybackToken, makeHlsTimestampTag, playbackResponse, reportListe
 import {
   getAlbum, getAlbumTracks, getArtist, getArtistAlbums, getArtistTop, getRelatedArtists,
   getPlaylist, getPlaylistTracks, getTrack, getTrackRadio, mapAlbum, mapAlbumSummary,
-  mapArtist, mapPlaylist, mapTrack, pagination, pipeGetAlbum, pipeGetArtist, pipeGetTrackLyrics, pipeGetTrackQualities, rest, safeHttpsUrl, searchPipe, searchRest, version,
+  mapArtist, mapPlaylist, mapTrack, pagination, pipeGetAlbum, pipeGetArtist, pipeGetTrackQualities, pipeGetTrackLyrics, rest, safeHttpsUrl, searchPipe, searchRest, version,
 } from "./deezer.js";
 
 const CORS = {
@@ -20,95 +20,399 @@ export default {
     const url = new URL(request.url);
     const requestId = crypto.randomUUID();
     const route = url.pathname.replace(/\/+$/, "") || "/";
-    const listenRoute = route === "/track" && url.searchParams.get("log") === "listen";
-    const signedPlaybackRoute = route === "/track" && url.searchParams.get("playback") === "1";
-    const signedManifestRoute = route === "/track" && url.searchParams.get("playback") === "manifest";
-    if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: headers() });
-    if (listenRoute ? request.method !== "POST" : request.method !== "GET") {
-      return fail(405, "METHOD_NOT_ALLOWED", listenRoute ? "Listen events must be sent with POST." : "This endpoint accepts GET requests, plus POST for /track?log=listen.", requestId, { Allow: listenRoute ? "POST, OPTIONS" : "GET, OPTIONS" });
-    }
+    const graphQLRoute = route === "/graphql";
+    const signedPlaybackRoute = route === "/delivery/audio" && url.searchParams.get("playback") === "1";
+    const signedManifestRoute = route === "/delivery/manifest" && url.searchParams.get("playback") === "manifest";
 
-    // Audio, HLS manifests and telemetry use short-lived HMAC-signed playback tokens.
-    // Catalog/full-manifest discovery itself remains protected by API_KEY; ARL is server-only.
-    if (listenRoute || signedPlaybackRoute || signedManifestRoute) {
-      if (!env?.API_KEY) return fail(503, "PLAYBACK_API_KEY_REQUIRED", "Configure API_KEY as a Cloudflare secret to sign and validate playback URLs.", requestId);
+    if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: headers() });
+    if (graphQLRoute && !["GET", "POST"].includes(request.method)) {
+      return graphQLHttpError(405, "METHOD_NOT_ALLOWED", "Use GET for read-only GraphQL queries or POST for mutations.", { Allow: "GET, POST, OPTIONS" }, request);
+    }
+    if (graphQLRoute && !acceptsGraphQLResponse(request)) {
+      return new Response("Not Acceptable", { status: 406, headers: headers({ "Content-Type": "text/plain; charset=utf-8" }) });
+    }
+    if (!graphQLRoute && (signedPlaybackRoute || signedManifestRoute) && request.method !== "GET") {
+      return fail(405, "METHOD_NOT_ALLOWED", "This endpoint accepts GET requests only.", requestId, { Allow: "GET, OPTIONS" });
+    }
+    if (!graphQLRoute && !signedPlaybackRoute && !signedManifestRoute && route !== "/") {
+      return fail(404, "ROUTE_MOVED_TO_GRAPHQL", "Catalog operations now use GET /graphql?query=... with a GraphQL selection set. See GET / for examples.", requestId);
+    }
+    // Signed media delivery is authorized using the short-lived token, not by sending
+    // the long-lived API key in the audio URL. All GraphQL operations use API_KEY when set.
+    if (signedPlaybackRoute || signedManifestRoute) {
+      if (!env?.API_KEY) return fail(503, "PLAYBACK_API_KEY_REQUIRED", "Configure API_KEY as a Cloudflare secret to validate signed media URLs.", requestId);
     } else {
       const authError = authorize(request, env);
-      if (authError) return fail(401, "UNAUTHORIZED", authError, requestId);
+      if (authError) return graphQLRoute
+        ? graphQLRequestError(401, "UNAUTHORIZED", authError, {}, request)
+        : fail(401, "UNAUTHORIZED", authError, requestId);
     }
+
     const rateError = checkRateLimit(request);
-    if (rateError) return fail(429, "RATE_LIMITED", "Too many requests from this client. Retry shortly.", requestId, { "Retry-After": "15" });
+    if (rateError) return graphQLRoute
+      ? graphQLRequestError(429, "RATE_LIMITED", "Too many requests from this client. Retry shortly.", { "Retry-After": "15" }, request)
+      : fail(429, "RATE_LIMITED", "Too many requests from this client. Retry shortly.", requestId, { "Retry-After": "15" });
 
     try {
-      if (listenRoute) return await trackListen(request, url, env);
+      if (graphQLRoute) return await handleGraphQL(request, env, url);
       if (signedManifestRoute) return await fullTrackHlsManifest(url, env);
       if (signedPlaybackRoute) return await fullTrackAudio(request, url, env);
-      if (route === "/") return json({ version: version(), Repo: "Deezer catalog and authenticated playback API (Tidal HiFi response-schema compatibility)" });
-      if (route === "/info") return await trackInfo(url);
-      if (route === "/track") return await trackManifestLegacy(url, env);
-      if (route === "/trackManifests") return await trackManifests(url, env);
-      if (route === "/recommendations") return await recommendations(url);
-      if (route === "/search") return await search(url, env);
-      if (route === "/album") return await album(url, env);
-      if (route === "/mix") return await mix(url);
-      if (route === "/playlist") return await playlist(url);
-      if (route === "/cover") return await cover(url);
-      if (route === "/artist") return await artist(url, env);
-      if (route === "/artist/similar") return await similarArtists(url);
-      if (route === "/lyrics") return await lyrics(url, env, requestId);
-      return fail(404, "ROUTE_NOT_FOUND", "This route is not part of the Deezer rebuild. Tidal-only Widevine and video routes are intentionally excluded.", requestId);
+      if (route === "/") return json({
+        name: "Deezer Graph API", version: version(), endpoint: "/graphql", methods: ["GET", "POST"],
+        example: "/graphql?query=%7B%20search(query%3A%22Ella%20Mai%22)%20%7B%20items%20%7B%20id%20title%20duration%20%7D%20%7D%20%7D",
+        note: "Uses GraphQL.js with a typed schema, specification validation, fragments, directives, introspection, and normal operation selection. GET is for queries; POST accepts JSON operations and mutations.",
+      });
+      return fail(404, "ROUTE_NOT_FOUND", "Unknown route.", requestId);
     } catch (error) {
       const status = Number.isInteger(error?.status) ? error.status : 502;
       const safeCode = String(error?.code || "");
-      const diagnosticCode = /^(ARL_|USER_DATA_|GATEWAY_|TRACK_TOKEN_|MEDIA_|PLAYBACK_|UPSTREAM_AUDIO_|UNALIGNED_CDN_|RANGE_|INVALID_RANGE)/.test(safeCode);
+      const diagnosticCode = /^(ARL_|USER_DATA_|GATEWAY_|TRACK_TOKEN_|MEDIA_|PLAYBACK_|UPSTREAM_AUDIO_|UNALIGNED_CDN_|RANGE_|INVALID_RANGE|GRAPHQL_)/.test(safeCode);
       const code = diagnosticCode ? safeCode : error?.status === 404 ? "NOT_FOUND" : status === 429 ? "UPSTREAM_RATE_LIMITED" : "UPSTREAM_ERROR";
-      // Expose only purpose-written diagnostic messages; never forward raw upstream bodies or tokens.
       const message = diagnosticCode ? String(error?.message || code).slice(0, 300) : publicMessage(error?.message, status);
       return fail(status, code, message, requestId);
     }
   },
 };
 
+function graphQLAcceptQualities(request) {
+  const accept = String(request?.headers?.get("Accept") || "").trim().toLowerCase();
+  if (!accept) return { graphQL: 1, json: 0, present: false };
+  const ranges = accept.split(",").map((entry, index) => {
+    const [rawType, ...parameters] = entry.trim().split(";");
+    const mediaType = rawType.trim();
+    const qRaw = parameters.find(parameter => /^\s*q\s*=/.test(parameter));
+    const q = qRaw ? Number(qRaw.split("=")[1]) : 1;
+    return { mediaType, q: Number.isFinite(q) && q >= 0 && q <= 1 ? q : 0, index };
+  });
+  const qualityFor = mediaType => {
+    const matching = ranges.filter(range => range.mediaType === mediaType || range.mediaType === "application/*" || range.mediaType === "*/*");
+    matching.sort((a, b) => {
+      const specificity = value => value.mediaType === mediaType ? 2 : value.mediaType === "application/*" ? 1 : 0;
+      return specificity(b) - specificity(a) || a.index - b.index;
+    });
+    return matching[0]?.q ?? 0;
+  };
+  return {
+    graphQL: qualityFor("application/graphql-response+json"),
+    json: qualityFor("application/json"),
+    present: true,
+  };
+}
+
+function acceptsGraphQLResponse(request) {
+  const qualities = graphQLAcceptQualities(request);
+  return !qualities.present || qualities.graphQL > 0 || qualities.json > 0;
+}
+
+function graphQLContentType(request) {
+  const { graphQL, json } = graphQLAcceptQualities(request);
+  return json > graphQL
+    ? "application/json; charset=utf-8"
+    : "application/graphql-response+json; charset=utf-8";
+}
+
+function graphQLJson(result, status = 200, extra = {}, request = null) {
+  return new Response(JSON.stringify(result), {
+    status,
+    headers: headers({ "Content-Type": graphQLContentType(request), ...extra }),
+  });
+}
+
+function graphQLHttpError(status, code, message, extraHeaders = {}, request = null) {
+  return graphQLJson({ errors: [{ message, extensions: { code, httpStatus: status } }] }, status, extraHeaders, request);
+}
+
+function graphQLRequestError(status, code, message, extraHeaders = {}, request = null) {
+  return graphQLHttpError(status, code, message, extraHeaders, request);
+}
+
+function formatGraphQLError(error, overrides = {}) {
+  const original = error?.originalError || error;
+  const status = Number.isInteger(original?.status) ? original.status : Number.isInteger(overrides.httpStatus) ? overrides.httpStatus : Number.isInteger(error?.extensions?.httpStatus) ? error.extensions.httpStatus : 500;
+  const code = String(original?.code || overrides.code || error?.extensions?.code || (status === 404 ? "NOT_FOUND" : status === 403 ? "FORBIDDEN" : status >= 500 ? "UPSTREAM_ERROR" : "GRAPHQL_ERROR"));
+  return {
+    message: String(error?.message || "GraphQL request failed").slice(0, 500),
+    ...(Array.isArray(error?.locations) && error.locations.length ? { locations: error.locations } : {}),
+    ...(Array.isArray(error?.path) ? { path: error.path } : {}),
+    extensions: { ...(error?.extensions || {}), code, httpStatus: status },
+  };
+}
+
+let cachedGraphQLSchema;
+
+async function handleGraphQL(request, env, requestUrl) {
+  const { parse, validate, execute, getOperationAST, getVariableValues, specifiedRules } = await import("graphql");
+  const { buildGraphQLSchema, queryComplexityRule, MAX_QUERY_LENGTH } = await import("./graphql.js");
+  let query;
+  let variables = {};
+  let operationName;
+  let extensions;
+
+  if (request.method === "GET") {
+    if (request.url.length > 65_536) {
+      return graphQLHttpError(414, "URI_TOO_LARGE", "The GraphQL GET URL is too long; send the operation using POST instead.", {}, request);
+    }
+    query = requestUrl.searchParams.get("query");
+    operationName = requestUrl.searchParams.has("operationName") ? requestUrl.searchParams.get("operationName") : undefined;
+    try {
+      if (requestUrl.searchParams.has("variables")) variables = JSON.parse(requestUrl.searchParams.get("variables")) ?? {};
+      if (requestUrl.searchParams.has("extensions")) extensions = JSON.parse(requestUrl.searchParams.get("extensions")) ?? undefined;
+    } catch {
+      return graphQLHttpError(400, "INVALID_JSON_PARAMETER", "The variables and extensions URL parameters must contain valid JSON.", {}, request);
+    }
+  } else {
+    const contentType = String(request.headers.get("Content-Type") || "").toLowerCase().split(";")[0].trim();
+    if (contentType !== "application/json") {
+      return graphQLHttpError(415, "UNSUPPORTED_MEDIA_TYPE", "POST /graphql requires Content-Type: application/json.", { "Accept": "application/json" }, request);
+    }
+
+    const bodyText = await request.text();
+    if (bodyText.length > 65_536) {
+      return graphQLHttpError(413, "GRAPHQL_REQUEST_TOO_LARGE", "GraphQL POST bodies must not exceed 65536 characters.", {}, request);
+    }
+    let payload;
+    try { payload = JSON.parse(bodyText); }
+    catch { return graphQLHttpError(400, "INVALID_JSON_BODY", "POST /graphql expects a valid JSON request object.", {}, request); }
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+      return graphQLHttpError(400, "INVALID_REQUEST_BODY", "POST /graphql expects a JSON object.", {}, request);
+    }
+    // The GraphQL-over-HTTP request object defines query, operationName,
+    // variables, and extensions. Unknown members are ignored for forward compatibility.
+    query = payload.query;
+    variables = payload.variables ?? {};
+    operationName = payload.operationName ?? undefined;
+    extensions = payload.extensions ?? undefined;
+    if (operationName !== undefined && typeof operationName !== "string") {
+      return graphQLHttpError(422, "INVALID_OPERATION_NAME", "operationName must be a string or null.", {}, request);
+    }
+  }
+
+  if (typeof query !== "string" || !query.trim()) {
+    return graphQLHttpError(400, "GRAPHQL_QUERY_REQUIRED", "The GraphQL query source must be provided in the query field or URL parameter.", {}, request);
+  }
+  if (query.length > MAX_QUERY_LENGTH) {
+    return graphQLHttpError(413, "GRAPHQL_QUERY_TOO_LARGE", `GraphQL query exceeds the ${MAX_QUERY_LENGTH}-character limit.`, {}, request);
+  }
+  if (!variables || typeof variables !== "object" || Array.isArray(variables)) {
+    return graphQLHttpError(422, "INVALID_VARIABLES", "variables must be a JSON object or null.", {}, request);
+  }
+  if (extensions != null && (typeof extensions !== "object" || Array.isArray(extensions))) {
+    return graphQLHttpError(422, "INVALID_EXTENSIONS", "extensions must be a JSON object or null.", {}, request);
+  }
+
+  let document;
+  try { document = parse(query); }
+  catch (error) {
+    return graphQLJson({ errors: [formatGraphQLError(error, { code: "GRAPHQL_PARSE_FAILED", httpStatus: 400 })] }, 400, {}, request);
+  }
+
+  if (!cachedGraphQLSchema) {
+    cachedGraphQLSchema = buildGraphQLSchema();
+  }
+  const validationErrors = validate(cachedGraphQLSchema, document, [...specifiedRules, queryComplexityRule]);
+  if (validationErrors.length) {
+    return graphQLJson({ errors: validationErrors.map(error => ({
+      message: error.message,
+      ...(error.locations?.length ? { locations: error.locations } : {}),
+      ...(error.path ? { path: error.path } : {}),
+      extensions: { ...(error.extensions || {}), code: error.extensions?.code || "GRAPHQL_VALIDATION_FAILED", httpStatus: 422 },
+    })) }, 422, {}, request);
+  }
+
+  const operation = getOperationAST(document, operationName);
+  if (!operation) {
+    const opCount = document.definitions.filter(definition => definition.kind === "OperationDefinition").length;
+    const code = operationName != null ? "GRAPHQL_UNKNOWN_OPERATION" : opCount > 1 ? "GRAPHQL_OPERATION_NAME_REQUIRED" : "GRAPHQL_OPERATION_NOT_FOUND";
+    const message = operationName != null
+      ? `No operation named '${operationName}' exists in this document.`
+      : opCount > 1 ? "operationName is required when a document contains multiple operations." : "The document contains no executable operation.";
+    return graphQLHttpError(422, code, message, {}, request);
+  }
+  if (operation.operation === "subscription") {
+    return graphQLHttpError(422, "GRAPHQL_SUBSCRIPTIONS_UNSUPPORTED", "This HTTP endpoint does not implement GraphQL subscriptions. Queries and mutations are supported.", {}, request);
+  }
+  if (request.method === "GET" && operation.operation === "mutation") {
+    return graphQLHttpError(405, "GET_MUTATION_NOT_ALLOWED", "Mutations must use POST; GET is reserved for read-only queries.", { Allow: "POST, OPTIONS" }, request);
+  }
+
+  const variableResult = getVariableValues(cachedGraphQLSchema, operation.variableDefinitions || [], variables, { maxErrors: 20 });
+  if (variableResult.errors?.length) {
+    return graphQLJson({ errors: variableResult.errors.map(error => formatGraphQLError(error, { code: "GRAPHQL_VARIABLE_COERCION_FAILED", httpStatus: 422 })) }, 422, {}, request);
+  }
+
+  const result = await execute({
+    schema: cachedGraphQLSchema,
+    document,
+    contextValue: { env, origin: requestUrl.origin, request, resolveQueryField, resolveMutationField },
+    variableValues: variables,
+    operationName,
+    options: { maxCoercionErrors: 20 },
+  });
+  const response = {
+    ...(Object.prototype.hasOwnProperty.call(result, "data") ? { data: result.data } : {}),
+    ...(result.errors?.length ? { errors: result.errors.map(formatGraphQLError) } : {}),
+    ...(result.extensions ? { extensions: result.extensions } : {}),
+  };
+  // Parse, validation, and variable-coercion failures are 4xx request errors;
+  // resolver failures follow GraphQL's partial-data model and return HTTP 200.
+  return graphQLJson(response, 200, {}, request);
+}
+
+async function resolveQueryField(name, args, env, origin) {
+  if (name === "apiInfo") return {
+    name: "Deezer Graph API", version: version(), endpoint: "/graphql", methods: ["GET", "POST"],
+    queryTransport: "GET /graphql?query=...&variables=...", mutationTransport: "POST /graphql",
+    features: ["catalog", "quality-reporting", "track-manifests", "hls", "lyrics", "playback-reporting", "artist-similarity", "graphql-js-schema-validation", "graphql-introspection"],
+  };
+  if (name === "search") {
+    const q = String(args.query ?? args.q ?? args.term ?? "").trim();
+    if (!q) throw Object.assign(new Error("search requires query: String!"), { code: "MISSING_QUERY", status: 400 });
+    const typeKey = String(args.type || "TRACK").toUpperCase();
+    const key = ({ TRACK: "s", SONG: "s", ARTIST: "a", ALBUM: "al", PLAYLIST: "p", ISRC: "i" })[typeKey];
+    if (!key) throw Object.assign(new Error("search type must be TRACK, ARTIST, ALBUM, PLAYLIST, or ISRC."), { code: "INVALID_SEARCH_TYPE", status: 400 });
+    const url = handlerUrl(origin, "/search", { [key]: q, limit: args.limit ?? 25, offset: args.offset ?? 0 });
+    const body = await handlerBody(await search(url, env));
+    let page = body.data;
+    const nesting = ({ a: "artists", al: "albums", p: "playlists" })[key];
+    if (nesting && page?.[nesting]) page = page[nesting];
+    return { ...page, query: q, type: typeKey };
+  }
+  if (name === "track" || name === "trackInfo") {
+    const id = requiredGraphQLId(args.id, name);
+    const track = mapTrack(await getTrack(id));
+    track.quality = await qualityReportFor(id, env, Boolean(track.preview));
+    return track;
+  }
+  if (name === "quality") {
+    const id = requiredGraphQLId(args.id, name);
+    return qualityReportFor(id, env, Boolean(args.includePreview));
+  }
+  if (name === "trackManifest") {
+    const id = requiredGraphQLId(args.id, name);
+    const params = { id, quality: args.quality, manifestType: args.manifestType, usage: args.usage, uriScheme: args.uriScheme };
+    if (args.formats != null) params.formats = Array.isArray(args.formats) ? args.formats.join(",") : args.formats;
+    const body = await handlerBody(await trackManifests(handlerUrl(origin, "/trackManifests", params), env));
+    const wrapper = body?.data;
+    const node = wrapper?.data;
+    if (node?.attributes) return { id: node.id, type: node.type, ...node.attributes, links: wrapper.links || null };
+    return wrapper ?? null;
+  }
+  if (name === "recommendations") {
+    const body = await handlerBody(await recommendations(handlerUrl(origin, "/recommendations", { id: requiredGraphQLId(args.id, name), limit: args.limit, offset: args.offset })));
+    return body.data;
+  }
+  if (name === "album") {
+    const body = await handlerBody(await album(handlerUrl(origin, "/album", { id: requiredGraphQLId(args.id, name), limit: args.limit, offset: args.offset }), env));
+    return body.data;
+  }
+  if (name === "mix") {
+    const body = await handlerBody(await mix(handlerUrl(origin, "/mix", { id: requiredGraphQLId(args.id, name), limit: args.limit, offset: args.offset })));
+    return { ...(body.mix || {}), items: body.items || [], pagination: body.pagination || null };
+  }
+  if (name === "playlist") {
+    const body = await handlerBody(await playlist(handlerUrl(origin, "/playlist", { id: requiredGraphQLId(args.id, name), limit: args.limit, offset: args.offset })));
+    return body.playlist;
+  }
+  if (name === "cover") {
+    const body = await handlerBody(await cover(handlerUrl(origin, "/cover", { id: args.id, q: args.query ?? args.q })));
+    return (body.covers || [])[0] || null;
+  }
+  if (name === "covers") {
+    const body = await handlerBody(await cover(handlerUrl(origin, "/cover", { id: args.id, q: args.query ?? args.q })));
+    return body.covers || [];
+  }
+  if (name === "artist") {
+    const body = await handlerBody(await artist(handlerUrl(origin, "/artist", { id: requiredGraphQLId(args.id, name) }), env));
+    return body.artist || null;
+  }
+  if (name === "artistCatalog") {
+    const body = await handlerBody(await artist(handlerUrl(origin, "/artist", {
+      f: requiredGraphQLId(args.id, name), skip_tracks: args.skipTracks, limit: args.limit, offset: args.offset,
+    }), env));
+    return body;
+  }
+  if (name === "similarArtists") {
+    const body = await handlerBody(await similarArtists(handlerUrl(origin, "/artist/similar", { id: requiredGraphQLId(args.id, name), limit: args.limit, offset: args.offset })));
+    return body.data;
+  }
+  if (name === "lyrics") {
+    const id = requiredGraphQLId(args.id, name);
+    if (!env?.DEEZER_ARL) throw Object.assign(new Error("Set DEEZER_ARL to request account-authorized lyrics from Pipe GraphQL."), { code: "ARL_REQUIRED", status: 503 });
+    const track = await pipeGetTrackLyrics(id, env);
+    const lyrics = track?.lyrics;
+    if (!lyrics) throw Object.assign(new Error("No lyrics are available for this track in the current region/account."), { code: "LYRICS_NOT_FOUND", status: 404 });
+    const format = String(args.type || "all").toLowerCase();
+    if (!(["all", "plain", "line", "word"].includes(format))) throw Object.assign(new Error("type must be all, plain, line, or word."), { code: "INVALID_LYRICS_TYPE", status: 400 });
+    const lines = Array.isArray(lyrics.synchronizedLines) ? lyrics.synchronizedLines : [];
+    const words = Array.isArray(lyrics.synchronizedWordByWordLines) ? lyrics.synchronizedWordByWordLines : [];
+    const availableTypes = [...(typeof lyrics.text === "string" ? ["plain"] : []), ...(lines.length ? ["line"] : []), ...(words.length ? ["word"] : [])];
+    if (format !== "all" && !availableTypes.includes(format)) throw Object.assign(new Error(`No ${format} lyrics are available for this track.`), { code: "LYRICS_FORMAT_UNAVAILABLE", status: 404 });
+    return {
+      trackId: Number(track.id || id), title: track.title || "", duration: Number(track.duration || 0), type: format, availableTypes,
+      ...(lyrics.writers != null ? { writers: lyrics.writers } : {}),
+      ...(lyrics.copyright != null ? { copyright: lyrics.copyright } : {}),
+      ...(lyrics.licence != null ? { licence: lyrics.licence } : {}),
+      ...(format === "all" || format === "plain" ? { plain: lyrics.text ?? null } : {}),
+      ...(format === "all" || format === "line" ? { synchronizedLines: lines } : {}),
+      ...(format === "all" || format === "word" ? { synchronizedWordByWordLines: words } : {}),
+    };
+  }
+  throw Object.assign(new Error(`Unknown query field '${name}'. Use the Deezer Graph API schema at /graphql.`), { code: "GRAPHQL_UNKNOWN_FIELD", status: 400 });
+}
+
+async function resolveMutationField(name, args, env) {
+  if (name === "reportPlayback") {
+    const result = await reportListen({ trackId: requiredGraphQLId(args.trackId, name), playToken: args.playToken, event: args.event }, env);
+    return { accepted: Boolean(result.accepted), duplicate: Boolean(result.duplicate), event: result.event || args.event, playToken: result.playToken || null };
+  }
+  throw Object.assign(new Error(`Unknown mutation field '${name}'.`), { code: "GRAPHQL_UNKNOWN_FIELD", status: 400 });
+}
+
+async function qualityReportFor(id, env, includePreview = false) {
+  let previewAvailable = Boolean(includePreview);
+  if (!env?.DEEZER_ARL) return { status: "AUTH_REQUIRED", predictedQuality: previewAvailable ? "PREVIEW" : null, formats: [], source: "PIPE_GRAPHQL", mediaUrlGenerated: false, reason: "Configure DEEZER_ARL to report account-specific format availability." };
+  try {
+    const data = await pipeGetTrackQualities([id], env);
+    return mapQualityReport(data[String(id)], { previewAvailable });
+  } catch (_) {
+    return { status: "UNKNOWN", predictedQuality: null, formats: [], source: "PIPE_GRAPHQL", mediaUrlGenerated: false, reason: "Quality metadata could not be retrieved." };
+  }
+}
+
+function requiredGraphQLId(value, field) {
+  const id = String(value ?? "");
+  if (!/^\d+$/.test(id)) throw Object.assign(new Error(`Field '${field}' requires a numeric id argument.`), { code: "INVALID_ID", status: 400 });
+  return id;
+}
+
+function handlerUrl(origin, path, params = {}) {
+  const url = new URL(path, origin);
+  for (const [key, value] of Object.entries(params)) {
+    if (value === undefined || value === null || value === "") continue;
+    if (Array.isArray(value)) {
+      for (const item of value) url.searchParams.append(key, String(item));
+    } else url.searchParams.set(key, String(value));
+  }
+  return url;
+}
+
+async function handlerBody(response) {
+  const body = await response.json().catch(() => null);
+  if (!response.ok || body?.error) {
+    const error = new Error(body?.error?.message || `Resolver failed (HTTP ${response.status}).`);
+    error.status = response.status || 502;
+    error.code = body?.error?.code || "UPSTREAM_ERROR";
+    throw error;
+  }
+  return body || {};
+}
+
+
+
 async function trackInfo(url) {
   const id = requiredId(url);
   const t = await getTrack(id);
   return json({ version: version(), data: mapTrack(t) });
-}
-
-async function lyrics(url, env, requestId) {
-  const id = requiredId(url);
-  const format = String(url.searchParams.get("type") || url.searchParams.get("format") || "all").toLowerCase();
-  if (!["all", "plain", "line", "word"].includes(format)) {
-    return fail(400, "INVALID_LYRICS_TYPE", "type must be all, plain, line, or word.", requestId);
-  }
-  if (!env?.DEEZER_ARL) {
-    return fail(503, "ARL_REQUIRED", "Set DEEZER_ARL to retrieve lyrics from Deezer Pipe GraphQL.", requestId);
-  }
-  const track = await pipeGetTrackLyrics(id, env);
-  if (!track) return fail(404, "LYRICS_NOT_FOUND", "Deezer did not return this track or its lyrics.", requestId);
-  const source = track.lyrics;
-  if (!source || (source.text == null && !Array.isArray(source.synchronizedLines) && !Array.isArray(source.synchronizedWordByWordLines))) {
-    return fail(404, "LYRICS_NOT_FOUND", "Deezer has no lyrics available for this track in the authenticated session's region.", requestId);
-  }
-  const plain = typeof source.text === "string" ? source.text : null;
-  const lines = Array.isArray(source.synchronizedLines) ? source.synchronizedLines : null;
-  const words = Array.isArray(source.synchronizedWordByWordLines) ? source.synchronizedWordByWordLines : null;
-  const data = {
-    trackId: numericId(track.id ?? id),
-    title: track.title || "",
-    duration: numericId(track.duration ?? 0),
-    type: format,
-    availableTypes: [ ...(plain !== null ? ["plain"] : []), ...(lines?.length ? ["line"] : []), ...(words?.length ? ["word"] : []) ],
-    ...(source.writers != null ? { writers: source.writers } : {}),
-    ...(source.copyright != null ? { copyright: source.copyright } : {}),
-    ...(source.licence != null ? { licence: source.licence } : {}),
-    ...(format === "all" || format === "plain" ? { plain } : {}),
-    ...(format === "all" || format === "line" ? { synchronizedLines: lines } : {}),
-    ...(format === "all" || format === "word" ? { synchronizedWordByWordLines: words } : {}),
-  };
-  const requestedAvailable = format === "all" || (format === "plain" && plain !== null) || (format === "line" && Boolean(lines?.length)) || (format === "word" && Boolean(words?.length));
-  if (!requestedAvailable) return fail(404, "LYRICS_FORMAT_UNAVAILABLE", `Deezer does not have ${format} lyrics for this track.`, requestId);
-  return json({ version: version(), data });
 }
 
 async function trackManifestLegacy(url, env) {
@@ -229,7 +533,7 @@ async function trackManifests(url, env) {
 }
 
 function makePlaybackUrl(baseUrl, id, format, token, hlsSegment = false) {
-  const playback = new URL("/track", baseUrl.origin);
+  const playback = new URL("/delivery/audio", baseUrl.origin);
   playback.searchParams.set("id", String(id));
   playback.searchParams.set("quality", String(format));
   playback.searchParams.set("playback", "1");
@@ -239,7 +543,7 @@ function makePlaybackUrl(baseUrl, id, format, token, hlsSegment = false) {
 }
 
 function makeHlsManifestUrl(baseUrl, id, format, token) {
-  const manifest = new URL("/track", baseUrl.origin);
+  const manifest = new URL("/delivery/manifest", baseUrl.origin);
   manifest.searchParams.set("id", String(id));
   manifest.searchParams.set("quality", String(format));
   manifest.searchParams.set("playback", "manifest");
@@ -406,7 +710,7 @@ function mapPipeSearchItem(key, n) {
     quality: mapQualityReport(n.media),
     url: `https://www.deezer.com/track/${encodeURIComponent(n.id)}`,
     ...(arts.length ? { artist: arts[0], artists: arts } : {}),
-    ...(n.album ? { album: { id: numericId(n.album.id), title: n.album.displayTitle || "", cover: urlOf(n.album.cover?.urls), url: `https://www.deezer.com/album/${encodeURIComponent(n.album.id)}` } } : {}),
+    ...(n.album ? { album: { id: numericId(n.album.id), title: n.album.displayTitle || "", cover: (Array.isArray(n.album.cover?.urls) ? n.album.cover.urls[0] : n.album.cover?.urls) || null, url: `https://www.deezer.com/album/${encodeURIComponent(n.album.id)}` } } : {}),
   };
   if (key === "a") return { id: numericId(n.id), name: n.name || "", url: `https://www.deezer.com/artist/${encodeURIComponent(n.id)}`, picture: urlOf(n.picture?.urls) };
   if (key === "al") return { id: numericId(n.id), title: n.displayTitle || "", type: n.type || null, url: `https://www.deezer.com/album/${encodeURIComponent(n.id)}`, cover: urlOf(n.cover?.urls), releaseDate: n.releaseDate || null, artists: edges(n.contributors).map(e => ({ id: numericId((e.node || e).id), name: (e.node || e).name || "" })) };

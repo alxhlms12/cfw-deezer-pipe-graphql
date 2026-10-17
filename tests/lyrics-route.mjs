@@ -30,20 +30,28 @@ globalThis.fetch = async (input, init = {}) => {
 
 try {
   const auth = { Authorization: `Bearer ${env.API_KEY}` };
-  const allResponse = await worker.fetch(new Request("https://worker.test/lyrics?id=42", { headers: auth }), env);
+  const allQuery = `query Lyrics($id: ID!) { lyrics(id: $id, type: ALL) { trackId title duration type availableTypes plain synchronizedLines { lrcTimestamp line lineTranslated milliseconds duration } synchronizedWordByWordLines { start end words { start end word } } } }`;
+  const allUrl = new URL("https://worker.test/graphql");
+  allUrl.searchParams.set("query", allQuery);
+  allUrl.searchParams.set("variables", JSON.stringify({ id: "42" }));
+  const allResponse = await worker.fetch(new Request(allUrl.toString(), { headers: auth }), env);
   assert.equal(allResponse.status, 200, await allResponse.clone().text());
   const all = await allResponse.json();
-  assert.equal(all.data.type, "all");
-  assert.equal(all.data.plain, "Example lyric line");
-  assert.equal(all.data.synchronizedLines.length, 1);
-  assert.equal(all.data.synchronizedWordByWordLines[0].words[0].word, "Example");
-  assert.deepEqual(all.data.availableTypes, ["plain", "line", "word"]);
+  assert.equal(all.errors, undefined, JSON.stringify(all.errors));
+  assert.equal(all.data.lyrics.type, "all");
+  assert.equal(all.data.lyrics.plain, "Example lyric line");
+  assert.equal(all.data.lyrics.synchronizedLines.length, 1);
+  assert.equal(all.data.lyrics.synchronizedWordByWordLines[0].words[0].word, "Example");
+  assert.deepEqual(all.data.lyrics.availableTypes, ["plain", "line", "word"]);
 
-  const wordResponse = await worker.fetch(new Request("https://worker.test/lyrics?id=42&type=word", { headers: auth }), env);
+  const wordQuery = `{ lyrics(id: "42", type: WORD) { type synchronizedWordByWordLines { start end words { word } } } }`;
+  const wordUrl = new URL("https://worker.test/graphql");
+  wordUrl.searchParams.set("query", wordQuery);
+  const wordResponse = await worker.fetch(new Request(wordUrl.toString(), { headers: auth }), env);
   assert.equal(wordResponse.status, 200);
   const word = await wordResponse.json();
-  assert.equal(word.data.synchronizedWordByWordLines.length, 1);
-  assert.equal("plain" in word.data, false);
+  assert.equal(word.data.lyrics.synchronizedWordByWordLines.length, 1);
+  assert.equal("plain" in word.data.lyrics, false);
   assert.ok(calls.some(call => call.url.hostname === "pipe.deezer.com"));
   console.log("Lyrics route test passed (plain, line-synced, word-synced, and all response shapes).");
 } finally {
