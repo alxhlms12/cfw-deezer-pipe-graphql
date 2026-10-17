@@ -15,6 +15,12 @@ globalThis.fetch = async (input, init = {}) => {
       album: { id: 8, title: "Example Album", cover_xl: "https://cdn.example.test/cover.jpg" },
     }] });
   }
+  if (url.hostname === "api.deezer.com" && url.pathname === "/artist/17") {
+    return Response.json({
+      id: 17, name: "Example Artist", link: "https://www.deezer.com/artist/17",
+      picture_xl: "https://cdn.example.test/artist-cover.jpg", nb_album: 42, nb_fan: 1200,
+    });
+  }
   throw new Error(`Unexpected upstream request: ${url}`);
 };
 
@@ -40,6 +46,19 @@ try {
   assert.equal(body.data.results.items[0].artist.name, "Ella Mai");
   assert.equal(body.data.results.items[0].album.title, "Example Album");
   assert.equal(restCalls, 1);
+
+  const artistQuery = `query Artist($id: ID!) { artist(id: $id) { id name picture numberOfAlbums fans fansCount cover { id name large } } }`;
+  const artistResponse = await worker.fetch(new Request(gqlUrl(artistQuery, { id: "17" }), {
+    headers: { Authorization: `Bearer ${env.API_KEY}` },
+  }), env);
+  assert.equal(artistResponse.status, 200, await artistResponse.clone().text());
+  const artistBody = await artistResponse.json();
+  assert.equal(artistBody.errors, undefined, JSON.stringify(artistBody.errors));
+  assert.equal(artistBody.data.artist.name, "Example Artist");
+  assert.equal(artistBody.data.artist.numberOfAlbums, 42);
+  assert.equal(artistBody.data.artist.cover.id, "17");
+  assert.equal(artistBody.data.artist.cover.name, "Example Artist");
+  assert.equal(artistBody.data.artist.cover.large, "https://cdn.example.test/artist-cover.jpg");
 
   // GET queries cannot perform mutations.
   const badGet = new URL("https://worker.test/graphql");

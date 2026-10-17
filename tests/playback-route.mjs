@@ -72,15 +72,23 @@ function gqlUrl(query, variables = {}) {
 const auth = { Authorization: `Bearer ${env.API_KEY}` };
 
 try {
-  const manifestQuery = `query Manifest($id: ID!) { trackManifest(id: $id, quality: FLAC) { id type trackPresentation uri manifestMimeType formats audioQuality format playbackToken previewDuration streamReady } }`;
+  const manifestQuery = `query Manifest($id: ID!) { trackManifest(id: $id, quality: FLAC) { id type trackId trackPresentation assetPresentation audioMode uri streamUrl manifest manifestMimeType formats audioQuality format playbackToken previewUrl previewDuration streamReady } }`;
   const manifestRes = await worker.fetch(new Request(gqlUrl(manifestQuery, { id: "99" }), { headers: auth }), env);
   assert.equal(manifestRes.status, 200, await manifestRes.clone().text());
   const manifestBody = await manifestRes.json();
   assert.equal(manifestBody.errors, undefined, JSON.stringify(manifestBody.errors));
   const attr = manifestBody.data.trackManifest;
   assert.equal(attr.trackPresentation, "FULL");
+  assert.equal(attr.trackId, "99");
+  assert.equal(attr.assetPresentation, "FULL");
+  assert.equal(attr.audioMode, "STEREO");
   assert.equal(attr.format, "FLAC");
   assert.match(attr.uri, /\/delivery\/audio\?/);
+  assert.equal(attr.streamUrl, attr.uri, "streamUrl must preserve the working REST field as the playable URL");
+  assert.equal(attr.streamReady, true);
+  assert.equal(attr.manifestMimeType, "application/json");
+  assert.deepEqual(JSON.parse(Buffer.from(attr.manifest, "base64").toString("utf8")).urls, [attr.streamUrl]);
+  assert.equal(attr.previewUrl, null);
   assert.doesNotMatch(JSON.stringify(manifestBody), /route-test-arl|route-license-token|route-track-token/);
   assert.ok(calls.some(x => new URL(x.url).hostname === "pipe.deezer.com"), "expected Pipe GraphQL playback lookup");
   assert.ok(!calls.some(x => new URL(x.url).searchParams.get("method") === "song.getListData"), "legacy song.getListData must not be used");
@@ -133,7 +141,7 @@ try {
     assert.equal(thresholdBody.data.reportPlayback.event, "30");
   } finally { Date.now = realNow; }
 
-  const hlsQuery = `query Hls($id: ID!) { trackManifest(id: $id, manifestType: HLS, usage: PLAYBACK) { id uri manifestMimeType formats audioQuality format playbackToken } }`;
+  const hlsQuery = `query Hls($id: ID!) { trackManifest(id: $id, manifestType: HLS, usage: PLAYBACK) { id trackId trackPresentation assetPresentation audioMode uri streamUrl manifest manifestMimeType formats audioQuality format streamReady playbackToken previewUrl } }`;
   const hlsManifestRes = await worker.fetch(new Request(gqlUrl(hlsQuery, { id: "99" }), { headers: auth }), env);
   assert.equal(hlsManifestRes.status, 200, await hlsManifestRes.clone().text());
   const hlsManifestBody = await hlsManifestRes.json();
@@ -141,6 +149,12 @@ try {
   const hlsAttributes = hlsManifestBody.data.trackManifest;
   assert.equal(hlsAttributes.manifestMimeType, "application/vnd.apple.mpegurl");
   assert.match(hlsAttributes.uri, /\/delivery\/manifest\?/);
+  assert.equal(hlsAttributes.streamUrl, hlsAttributes.uri, "HLS streamUrl must be the playlist URL, not null or the audio segment URL");
+  assert.equal(hlsAttributes.trackId, "99");
+  assert.equal(hlsAttributes.assetPresentation, "FULL");
+  assert.equal(hlsAttributes.audioMode, "STEREO");
+  assert.equal(hlsAttributes.streamReady, true);
+  assert.equal(hlsAttributes.previewUrl, null);
   assert.ok(["MP3_320", "MP3_128"].includes(hlsAttributes.format));
   const hlsPlaylistResponse = await worker.fetch(new Request(hlsAttributes.uri), env);
   assert.equal(hlsPlaylistResponse.status, 200, await hlsPlaylistResponse.clone().text());
@@ -156,6 +170,31 @@ try {
   const packedAudio = new Uint8Array(await hlsSegment.arrayBuffer());
   assert.equal(String.fromCharCode(...packedAudio.subarray(0, 3)), "ID3");
   assert.equal(packedAudio.byteLength, audio.length + (await import("../src/playback.js")).makeHlsTimestampTag().byteLength);
+
+  const previewQuery = `query Preview($id: ID!) { trackManifest(id: $id, quality: PREVIEW) { id trackId trackPresentation assetPresentation audioMode uri streamUrl previewUrl manifest manifestMimeType format audioQuality streamReady previewDuration } }`;
+  const previewRes = await worker.fetch(new Request(gqlUrl(previewQuery, { id: "99" }), { headers: auth }), env);
+  assert.equal(previewRes.status, 200, await previewRes.clone().text());
+  const previewBody = await previewRes.json();
+  assert.equal(previewBody.errors, undefined, JSON.stringify(previewBody.errors));
+  const preview = previewBody.data.trackManifest;
+  assert.equal(preview.trackPresentation, "PREVIEW");
+  assert.equal(preview.assetPresentation, "PREVIEW");
+  assert.equal(preview.streamReady, true);
+  assert.equal(preview.streamUrl, "https://cdns-preview.dzcdn.net/test-preview.mp3");
+  assert.equal(preview.previewUrl, preview.streamUrl);
+  assert.equal(preview.audioQuality, "PREVIEW");
+  assert.deepEqual(JSON.parse(Buffer.from(preview.manifest, "base64").toString("utf8")).urls, [preview.streamUrl]);
+
+  const dataUriQuery = `query DataUri($id: ID!) { trackManifest(id: $id, quality: FLAC, uriScheme: DATA) { uri streamUrl streamReady manifest } }`;
+  const dataUriRes = await worker.fetch(new Request(gqlUrl(dataUriQuery, { id: "99" }), { headers: auth }), env);
+  assert.equal(dataUriRes.status, 200, await dataUriRes.clone().text());
+  const dataUriBody = await dataUriRes.json();
+  assert.equal(dataUriBody.errors, undefined, JSON.stringify(dataUriBody.errors));
+  const dataUriManifest = dataUriBody.data.trackManifest;
+  assert.match(dataUriManifest.uri, /^data:application\/json;base64,/);
+  assert.match(dataUriManifest.streamUrl, /\/delivery\/audio\?/);
+  assert.equal(dataUriManifest.streamReady, true);
+  assert.deepEqual(JSON.parse(Buffer.from(dataUriManifest.manifest, "base64").toString("utf8")).urls, [dataUriManifest.streamUrl]);
 
   const dashQuery = `query Dash($id: ID!) { trackManifest(id: $id, manifestType: MPEG_DASH) { id uri manifestMimeType } }`;
   const dash = await worker.fetch(new Request(gqlUrl(dashQuery, { id: "99" }), { headers: auth }), env);

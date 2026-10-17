@@ -294,7 +294,30 @@ async function resolveQueryField(name, args, env, origin) {
     const body = await handlerBody(await trackManifests(handlerUrl(origin, "/trackManifests", params), env));
     const wrapper = body?.data;
     const node = wrapper?.data;
-    if (node?.attributes) return { id: node.id, type: node.type, ...node.attributes, links: wrapper.links || null };
+    if (node?.attributes) {
+      const attributes = node.attributes;
+      const trackPresentation = attributes.trackPresentation ?? attributes.assetPresentation ?? null;
+      // Keep the former REST response fields available in GraphQL. `uri` can be a
+      // data: manifest descriptor, while `streamUrl` must always be the actual
+      // playable source (preview audio, progressive audio, or an HLS playlist).
+      const streamUrl = attributes.streamUrl ?? attributes.previewUrl ?? (
+        typeof attributes.uri === "string" && !attributes.uri.startsWith("data:")
+          ? attributes.uri
+          : null
+      );
+      return {
+        id: node.id,
+        type: node.type,
+        ...attributes,
+        trackId: attributes.trackId ?? node.id,
+        assetPresentation: attributes.assetPresentation ?? trackPresentation,
+        audioMode: attributes.audioMode ?? "STEREO",
+        streamReady: attributes.streamReady ?? Boolean(streamUrl),
+        streamUrl,
+        previewUrl: attributes.previewUrl ?? (trackPresentation === "PREVIEW" ? streamUrl : null),
+        links: wrapper.links || null,
+      };
+    }
     return wrapper ?? null;
   }
   if (name === "recommendations") {
@@ -323,7 +346,10 @@ async function resolveQueryField(name, args, env, origin) {
   }
   if (name === "artist") {
     const body = await handlerBody(await artist(handlerUrl(origin, "/artist", { id: requiredGraphQLId(args.id, name) }), env));
-    return body.artist || null;
+    // The legacy catalog response places the artist cover beside `artist`; fold
+    // it into the typed GraphQL Artist object so `artist { cover { ... } }` works.
+    if (!body.artist) return null;
+    return { ...body.artist, ...(body.cover ? { cover: body.cover } : {}) };
   }
   if (name === "artistCatalog") {
     const body = await handlerBody(await artist(handlerUrl(origin, "/artist", {
@@ -488,9 +514,11 @@ async function trackManifests(url, env) {
     }
     return json({ version: "2.7", data: { data: {
       id: String(id), type: "trackManifests", attributes: {
-        trackPresentation: "FULL", uri, manifestMimeType: "application/vnd.apple.mpegurl",
+        trackId: Number(id), trackPresentation: "FULL", assetPresentation: "FULL", audioMode: "STEREO",
+        uri, streamUrl: manifestUrl, manifestMimeType: "application/vnd.apple.mpegurl",
+        ...(uri.startsWith("data:") ? { manifest: uri.slice(uri.indexOf(",") + 1) } : {}),
         formats: [resolved.format], audioQuality: resolved.profile.badge, format: resolved.format,
-        playbackToken: token,
+        streamReady: true, playbackToken: token,
       },
     }, links: { self: `${url.pathname}${url.search}` } } });
   }
@@ -505,11 +533,13 @@ async function trackManifests(url, env) {
     const useData = (url.searchParams.get("uriScheme") || "HTTPS").toUpperCase() === "DATA";
     const manifest = { mimeType: "audio/mpeg", codecs: "mp3", encryptionType: "NONE", presentation: "PREVIEW", urls: [preview] };
     const self = `${url.pathname}${url.search}`;
+    const encodedManifest = toBase64(JSON.stringify(manifest));
     return json({ version: "2.7", data: { data: {
       id: String(t.id), type: "trackManifests", attributes: {
-        trackPresentation: "PREVIEW", uri: useData ? `data:application/json;base64,${toBase64(JSON.stringify(manifest))}` : preview,
-        formats: ["MP3_PREVIEW"], previewDuration: 30,
-        ...(useData ? { manifestMimeType: "application/json" } : {}),
+        trackId: Number(t.id), trackPresentation: "PREVIEW", assetPresentation: "PREVIEW", audioMode: "STEREO",
+        uri: useData ? `data:application/json;base64,${encodedManifest}` : preview,
+        streamUrl: preview, previewUrl: preview, manifest: encodedManifest, manifestMimeType: "application/json",
+        formats: ["MP3_PREVIEW"], audioQuality: "PREVIEW", format: "MP3_PREVIEW", streamReady: true, previewDuration: 30,
       },
     }, links: { self } } });
   }
@@ -523,11 +553,14 @@ async function trackManifests(url, env) {
   const manifest = { mimeType: resolved.profile.mime, codecs: resolved.profile.codecs, encryptionType: "NONE", presentation: "FULL", urls: [playbackUrl] };
   const useData = (url.searchParams.get("uriScheme") || "HTTPS").toUpperCase() === "DATA";
   const self = `${url.pathname}${url.search}`;
+  const encodedManifest = toBase64(JSON.stringify(manifest));
   return json({ version: "2.7", data: { data: {
     id: String(id), type: "trackManifests", attributes: {
-      trackPresentation: "FULL", uri: useData ? `data:application/json;base64,${toBase64(JSON.stringify(manifest))}` : playbackUrl,
+      trackId: Number(id), trackPresentation: "FULL", assetPresentation: "FULL", audioMode: "STEREO",
+      uri: useData ? `data:application/json;base64,${encodedManifest}` : playbackUrl,
+      streamUrl: playbackUrl, manifest: encodedManifest, manifestMimeType: "application/json",
       formats: [resolved.format], audioQuality: resolved.profile.badge, format: resolved.format,
-      playbackToken: token, ...(useData ? { manifestMimeType: "application/json" } : {}),
+      streamReady: true, playbackToken: token,
     },
   }, links: { self } } });
 }

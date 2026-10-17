@@ -1,7 +1,7 @@
 const REST = "https://api.deezer.com";
 const PIPE = "https://pipe.deezer.com/api";
 const AUTH = "https://auth.deezer.com/login/arl";
-const APP_VERSION = "3.2.1";
+const APP_VERSION = "3.2.2";
 
 let jwt = "";
 let jwtExpiresAt = 0;
