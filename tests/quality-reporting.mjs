@@ -44,7 +44,7 @@ try {
   assert.equal(response.status, 200);
   const body = await response.json();
   const track = body.data.search.items[0];
-  assert.equal(track.id, 472400862);
+  assert.equal(track.id, "472400862", "GraphQL ID fields serialize as strings");
   assert.equal(track.quality.status, "AVAILABLE");
   assert.equal(track.quality.predictedQuality, "LOSSLESS");
   assert.equal(track.quality.bestFormat, "FLAC");

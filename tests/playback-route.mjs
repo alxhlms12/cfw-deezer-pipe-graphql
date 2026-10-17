@@ -125,6 +125,7 @@ try {
   }), env);
   const early = await earlyResponse.json();
   assert.equal(earlyResponse.status, 200);
+  assert.ok(early.data, JSON.stringify(early));
   assert.equal(early.data.reportPlayback, null);
   assert.equal(early.errors[0].extensions.code, "LISTEN_THRESHOLD_TOO_EARLY");
 

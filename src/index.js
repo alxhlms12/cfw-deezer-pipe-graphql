@@ -259,11 +259,20 @@ async function handleGraphQL(request, env, requestUrl) {
 }
 
 async function resolveQueryField(name, args, env, origin) {
-  if (name === "apiInfo") return {
-    name: "Deezer Graph API", version: version(), endpoint: "/graphql", methods: ["GET", "POST"],
-    queryTransport: "GET /graphql?query=...&variables=...", mutationTransport: "POST /graphql",
-    features: ["catalog", "quality-reporting", "track-manifests", "hls", "lyrics", "playback-reporting", "artist-similarity", "graphql-js-schema-validation", "graphql-introspection"],
-  };
+  if (name === "apiInfo") {
+    const supportedFeatures = [
+      "catalog", "quality-reporting", "track-manifests", "hls", "lyrics",
+      "playback-reporting", "artist-similarity", "graphql-js-schema-validation",
+      "graphql-introspection",
+    ];
+    return {
+      name: "Deezer Graph API", version: version(), endpoint: "/graphql", methods: ["GET", "POST"],
+      queryTransport: "GET /graphql?query=...&variables=...", mutationTransport: "POST /graphql",
+      features: supportedFeatures,
+      supportedFeatures,
+      transportDescription: "Send read-only queries with GET /graphql?query=... and optional JSON-encoded variables=...; send queries and mutations with POST /graphql using a JSON body. Mutations over GET are rejected.",
+    };
+  }
   if (name === "search") {
     const q = String(args.query ?? args.q ?? args.term ?? "").trim();
     if (!q) throw Object.assign(new Error("search requires query: String!"), { code: "MISSING_QUERY", status: 400 });

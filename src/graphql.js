@@ -479,7 +479,9 @@ const ApiInfoType = new GraphQLObjectType({
     methods: { type: listOf(GraphQLString) },
     queryTransport: { type: GraphQLString },
     mutationTransport: { type: GraphQLString },
-    features: { type: listOf(GraphQLString) },
+    features: { type: listOf(GraphQLString), description: "Backward-compatible alias for supportedFeatures." },
+    supportedFeatures: { type: listOf(GraphQLString), description: "Feature identifiers implemented by this API deployment." },
+    transportDescription: { type: GraphQLString, description: "How to send query and mutation operations to this endpoint." },
   },
 });
 
@@ -565,7 +567,7 @@ export function buildGraphQLSchema() {
   const MutationType = new GraphQLObjectType({
     name: "Mutation",
     fields: {
-      reportPlayback: mutationField("reportPlayback", nonNull(PlaybackReportType), {
+      reportPlayback: mutationField("reportPlayback", PlaybackReportType, {
         trackId: { type: nonNull(GraphQLID) },
         playToken: { type: nonNull(GraphQLString) },
         event: { type: nonNull(PlaybackEvent) },

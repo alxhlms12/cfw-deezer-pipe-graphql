@@ -6,6 +6,7 @@ const resolver = async (name, args) => {
   if (name === "apiInfo") return {
     name: "Deezer Graph API", version: "3.2.1", endpoint: "/graphql", methods: ["GET", "POST"],
     queryTransport: "GET /graphql?query=...&variables=...", mutationTransport: "POST /graphql", features: ["graphql-introspection"],
+    supportedFeatures: ["graphql-introspection"], transportDescription: "Queries use GET or POST; mutations use POST.",
   };
   if (name === "search") {
     const items = args.query === "mixed"
@@ -52,6 +53,15 @@ assert.equal(result.errors, undefined, JSON.stringify(result.errors));
 assert.equal(result.data.results.items[0].id, "12");
 assert.equal(result.data.results.items[0].artist.name, "Example Artist");
 assert.equal("preview" in result.data.results.items[0], false, "@include should honour its variable default");
+
+const apiInfoResult = await execute({
+  schema,
+  document: parse("{ apiInfo { name version supportedFeatures transportDescription } }"),
+  contextValue: { env: {}, origin: "https://worker.test", resolveQueryField: resolver, resolveMutationField: resolver },
+});
+assert.equal(apiInfoResult.errors, undefined, JSON.stringify(apiInfoResult.errors));
+assert.deepEqual(apiInfoResult.data.apiInfo.supportedFeatures, ["graphql-introspection"]);
+assert.match(apiInfoResult.data.apiInfo.transportDescription, /GET|POST/);
 
 const mixedDocument = parse(`{
   search(query: "mixed") {

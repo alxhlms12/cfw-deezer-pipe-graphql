@@ -3,6 +3,12 @@ import worker from "../src/index.js";
 
 const originalFetch = globalThis.fetch;
 const env = { API_KEY: "graphql-test-key", DEEZER_ARL: "graphql-test-arl" };
+function gqlUrl(query, variables = {}) {
+  const url = new URL("https://worker.test/graphql");
+  url.searchParams.set("query", query);
+  if (Object.keys(variables).length) url.searchParams.set("variables", JSON.stringify(variables));
+  return url.toString();
+}
 let restCalls = 0;
 globalThis.fetch = async (input, init = {}) => {
   const url = new URL(typeof input === "string" || input instanceof URL ? String(input) : input.url);
@@ -25,6 +31,16 @@ globalThis.fetch = async (input, init = {}) => {
 };
 
 try {
+  const apiInfoResponse = await worker.fetch(new Request(gqlUrl("{ apiInfo { name version supportedFeatures transportDescription } }"), {
+    headers: { Authorization: `Bearer ${env.API_KEY}` },
+  }), env);
+  assert.equal(apiInfoResponse.status, 200, await apiInfoResponse.clone().text());
+  const apiInfoBody = await apiInfoResponse.json();
+  assert.equal(apiInfoBody.errors, undefined, JSON.stringify(apiInfoBody.errors));
+  assert.equal(apiInfoBody.data.apiInfo.name, "Deezer Graph API");
+  assert.ok(apiInfoBody.data.apiInfo.supportedFeatures.includes("graphql-introspection"));
+  assert.match(apiInfoBody.data.apiInfo.transportDescription, /GET.*POST|POST.*GET/);
+
   const query = `query Search($term: String!, $limit: Int = 5) {
     results: search(query: $term, type: TRACK, limit: $limit) {
       query type totalNumberOfItems limit offset
@@ -42,7 +58,7 @@ try {
   assert.equal(body.data.results.query, "Ella Mai");
   assert.equal(body.data.results.type, "TRACK");
   assert.equal(body.data.results.limit, 5, "GraphQL variable defaults should apply");
-  assert.equal(body.data.results.items[0].id, 44);
+  assert.equal(body.data.results.items[0].id, "44", "GraphQL ID fields serialize as strings");
   assert.equal(body.data.results.items[0].artist.name, "Ella Mai");
   assert.equal(body.data.results.items[0].album.title, "Example Album");
   assert.equal(restCalls, 1);
@@ -107,7 +123,7 @@ try {
   const root = await worker.fetch(new Request("https://worker.test/", { headers: { Authorization: `Bearer ${env.API_KEY}` } }), env);
   assert.equal(root.status, 200);
   assert.equal((await root.json()).endpoint, "/graphql");
-  console.log("GraphQL route tests passed (GET query, URL variables, typed selection, aliases, defaults, method errors, and retired REST route).");
+  console.log("GraphQL route tests passed (apiInfo metadata, GET query, URL variables, typed selection, aliases, defaults, method errors, and retired REST route).");
 } finally {
   globalThis.fetch = originalFetch;
 }

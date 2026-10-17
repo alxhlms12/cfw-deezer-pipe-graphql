@@ -14,6 +14,7 @@ The service is not a complete implementation of every possible GraphQL-over-HTTP
 - Account-specific quality prediction through Deezer Pipe GraphQL when `DEEZER_ARL` is configured.
 - Preview or full-track progressive playback manifests, HLS manifests, and signed media delivery URLs. MPEG-DASH and download usage are recognized by the API but are currently reported as unsupported by the adapter.
 - Optional playback reporting through the `reportPlayback` mutation. Deezer's `log.listen` protocol is undocumented, so an accepted response is not proof of listening-history or royalty credit.
+  `reportPlayback` is nullable at the schema level so expected playback-threshold errors remain scoped to that field instead of nulling the entire GraphQL `data` object.
 - Legacy module-specific routes, fields, client helpers, settings, and tests have been removed; the API surface is GraphQL-first.
 - Responses are not cached; `Cache-Control: no-store` is retained for repeatable testing. A per-isolate rate limiter is best-effort; use Cloudflare-level rate limiting for production.
 
@@ -93,7 +94,7 @@ Example URL with variables and an operation name, after encoding the `query` and
 
 | Field | Arguments | Result |
 |---|---|---|
-| `apiInfo` | none | Name, version, supported features, transport description |
+| `apiInfo` | none | Name, version, `supportedFeatures`, `transportDescription`, and backward-compatible transport/feature aliases (`features`, `queryTransport`, `mutationTransport`) |
 | `search` | `query` or `q`/`term`, `type`, `limit`, `offset` | Typed search result page; default `type` is `TRACK` |
 | `track`, `trackInfo` | `id: ID!` | Track metadata and quality prediction; does not create a media URL |
 | `quality` | `id: ID!`, `includePreview` | Account-specific format-availability report |

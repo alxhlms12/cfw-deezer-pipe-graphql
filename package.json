@@ -1,6 +1,6 @@
 {
   "name": "deezer-graph-api",
-  "version": "3.2.2",
+  "version": "3.2.5",
   "private": true,
   "type": "module",
   "scripts": {
