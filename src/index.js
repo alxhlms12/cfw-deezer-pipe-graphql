@@ -2,8 +2,10 @@ import { distance } from "./wasm-match.js";
 import { createPlaybackToken, makeHlsTimestampTag, playbackResponse, reportListen, resolveFullTrack, validatePlaybackToken } from "./playback.js";
 import {
   getAlbum, getAlbumTracks, getArtist, getArtistAlbums, getArtistTop, getRelatedArtists,
-  getPlaylist, getPlaylistTracks, getTrack, getTrackRadio, mapAlbum, mapAlbumSummary,
-  mapArtist, mapPlaylist, mapTrack, pagination, pipeGetAlbum, pipeGetArtist, pipeGetTrackQualities, pipeGetTrackLyrics, rest, safeHttpsUrl, searchPipe, searchRest, version,
+  getPlaylist, getPlaylistTracks, getTrack, getTrackRadio, getTracksByIds, getPodcast, getPodcastEpisodes,
+  searchPodcasts, getGenres, getGenre, getGenreArtists, getRadioStations, getRadioStation, getRadioTracks,
+  getPicture, mapAlbum, mapAlbumSummary, mapArtist, mapPlaylist, mapTrack, pagination,
+  pipeGetAlbum, pipeGetArtist, pipeGetTrackQualities, pipeGetTrackLyrics, pipeQuery, rest, safeHttpsUrl, searchPipe, searchRest, version,
 } from "./deezer.js";
 
 const CORS = {
@@ -262,8 +264,9 @@ async function resolveQueryField(name, args, env, origin) {
   if (name === "apiInfo") {
     const supportedFeatures = [
       "catalog", "quality-reporting", "track-manifests", "hls", "lyrics",
-      "playback-reporting", "artist-similarity", "graphql-js-schema-validation",
-      "graphql-introspection",
+      "playback-reporting", "artist-similarity", "similar-tracks", "track-mix", "artist-mix",
+      "batch-track-lookup", "album-editions", "country-charts", "podcast-catalog", "genre-discovery",
+      "radio-discovery", "rich-track-metadata", "graphql-js-schema-validation", "graphql-introspection",
     ];
     return {
       name: "Deezer Graph API", version: version(), endpoint: "/graphql", methods: ["GET", "POST"],
@@ -370,6 +373,114 @@ async function resolveQueryField(name, args, env, origin) {
     const body = await handlerBody(await similarArtists(handlerUrl(origin, "/artist/similar", { id: requiredGraphQLId(args.id, name), limit: args.limit, offset: args.offset })));
     return body.data;
   }
+  if (name === "similarTracks") {
+    const id = requiredGraphQLId(args.id, name);
+    const limit = clampGraphQLNumber(args.limit, 20, 1, 100);
+    const offset = clampGraphQLNumber(args.offset, 0, 0, 5000);
+    const response = await getTrackRadio(id, limit, offset);
+    return { limit, offset, totalNumberOfItems: Number(response.total ?? response.data?.length ?? 0), items: (response.data || []).map(t => ({ track: mapTrack(t), sources: ["SIMILAR_TRACKS"] })) };
+  }
+  if (name === "trackMix") {
+    const ids = validateGraphQLIdList(args.ids, name, 20);
+    const limit = clampGraphQLNumber(args.limit, 40, 1, 100);
+    const offset = clampGraphQLNumber(args.offset, 0, 0, 5000);
+    const seed = await Promise.all(ids.map(id => getTrack(id).catch(() => null)));
+    const radios = await Promise.all(ids.map(id => getTrackRadio(id, Math.min(100, limit + offset), 0).catch(() => ({ data: [], total: 0 }))));
+    const tracks = interleaveUnique(radios.map(r => (r.data || []).map(mapTrack)));
+    const page = tracks.slice(offset, offset + limit);
+    return { id: ids.join(","), title: "Track Mix", subTitle: seed.filter(Boolean).map(t => t.title).slice(0, 3).join(" · "), description: "A mix assembled from public track-radio recommendations.", mixType: "TRACK_MIX", contentBehavior: "UNRESTRICTED", items: page, pagination: { limit, offset, totalNumberOfItems: tracks.length, hasNextPage: offset + limit < tracks.length } };
+  }
+  if (name === "artistMix") {
+    const ids = validateGraphQLIdList(args.ids, name, 10);
+    const limit = clampGraphQLNumber(args.limit, 40, 1, 100);
+    const offset = clampGraphQLNumber(args.offset, 0, 0, 5000);
+    const artists = await Promise.all(ids.map(id => getArtist(id).catch(() => null)));
+    const tops = await Promise.all(ids.map(id => getArtistTop(id, Math.min(100, limit + offset)).catch(() => ({ data: [], total: 0 }))));
+    const tracks = interleaveUnique(tops.map(r => (r.data || []).map(mapTrack)));
+    return { id: ids.join(","), title: "Artist Mix", subTitle: artists.filter(Boolean).map(a => a.name).slice(0, 3).join(" · "), description: "A mix assembled from public artist top-track catalogs.", mixType: "ARTIST_MIX", contentBehavior: "UNRESTRICTED", items: tracks.slice(offset, offset + limit), pagination: { limit, offset, totalNumberOfItems: tracks.length, hasNextPage: offset + limit < tracks.length } };
+  }
+  if (name === "tracksByIds") {
+    const ids = validateGraphQLIdList(args.ids, name, 100);
+    const tracks = await getTracksByIds(ids);
+    const byId = new Map(tracks.filter(Boolean).map(track => [String(track.id), mapTrack(track)]));
+    // Preserve requested order and duplicates where the caller supplied them.
+    return ids.map(id => byId.get(id) || null);
+  }
+  if (name === "albumEditions") {
+    const id = requiredGraphQLId(args.id, name);
+    const limit = clampGraphQLNumber(args.limit, 25, 1, 100);
+    const source = await getAlbum(id);
+    const title = String(source?.title || "").trim();
+    if (!title) return [];
+    const query = [title, source?.artist?.name].filter(Boolean).join(" ");
+    const results = await searchRest("album", query, Math.min(100, limit * 4), 0);
+    const norm = value => String(value || "").normalize("NFKD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+    const titleKey = norm(title);
+    const artistKey = norm(source?.artist?.name);
+    const seen = new Set([String(id)]);
+    return (results.data || []).filter(item => {
+      const candidateTitle = norm(item.title);
+      const candidateArtist = norm(item.artist?.name);
+      if (!candidateTitle || candidateTitle !== titleKey || (artistKey && candidateArtist && candidateArtist !== artistKey)) return false;
+      const candidateId = String(item.id);
+      if (seen.has(candidateId)) return false;
+      seen.add(candidateId); return true;
+    }).slice(0, limit).map(item => ({ ...mapAlbumSummary(item), artist: mapArtist(item.artist), artists: item.artist ? [mapArtist(item.artist)] : [] }));
+  }
+  if (name === "countryCharts") {
+    const countryCode = String(args.countryCode || "").trim().toUpperCase();
+    if (!/^[A-Z]{2}$/.test(countryCode)) throw Object.assign(new Error("countryCode must be a two-letter ISO country code."), { code: "INVALID_COUNTRY_CODE", status: 400 });
+    if (!env?.DEEZER_ARL) throw Object.assign(new Error("Country charts through Pipe require DEEZER_ARL; use public charts from Deezer's REST API if you do not configure it."), { code: "ARL_REQUIRED", status: 503 });
+    const category = String(args.category || "TRACK").toUpperCase();
+    const field = ({ TRACK: "tracks", ALBUM: "albums", ARTIST: "artists", PLAYLIST: "playlists" })[category];
+    if (!field) throw Object.assign(new Error("category must be TRACK, ALBUM, ARTIST, or PLAYLIST."), { code: "INVALID_CHART_CATEGORY", status: 400 });
+    const limit = clampGraphQLNumber(args.limit, 25, 1, 100);
+    const after = args.after == null ? null : String(args.after);
+    const selection = pipeChartSelection(category);
+    const query = `query PublicCountryCharts($countryCode: String!, $first: Int!, $after: String) { charts { country(countryCode: $countryCode) { ${field}(first: $first, after: $after) { edges { node { ${selection} } } pageInfo { hasNextPage endCursor } } } } }`;
+    const data = await pipeQuery(query, { countryCode, first: limit, after }, env);
+    const connection = data?.charts?.country?.[field];
+    if (!connection) throw Object.assign(new Error("Deezer Pipe returned no country-chart connection; verify the upstream chart field names and account access."), { code: "GRAPHQL_PIPE_COUNTRY_CHARTS_UNAVAILABLE", status: 502 });
+    const items = (connection.edges || []).map(edge => mapPipeSearchItem(({ TRACK: "s", ALBUM: "al", ARTIST: "a", PLAYLIST: "p" })[category], edge?.node)).filter(Boolean);
+    return { query: `country:${countryCode}`, type: category, limit, offset: 0, totalNumberOfItems: items.length, hasNextPage: Boolean(connection?.pageInfo?.hasNextPage), nextCursor: connection?.pageInfo?.endCursor ?? null, items };
+  }
+  if (name === "podcastSearch") {
+    const q = String(args.query || "").trim();
+    if (!q) throw Object.assign(new Error("podcastSearch requires a non-empty query."), { code: "MISSING_QUERY", status: 400 });
+    const limit = clampGraphQLNumber(args.limit, 25, 1, 100);
+    const offset = clampGraphQLNumber(args.offset, 0, 0, 5000);
+    const found = await searchPodcasts(q, limit, offset);
+    return { query: q, limit, offset, totalNumberOfItems: Number(found.total ?? found.data?.length ?? 0), items: (found.data || []).map(mapPodcast) };
+  }
+  if (name === "podcast") {
+    const id = requiredGraphQLId(args.id, name);
+    const limit = clampGraphQLNumber(args.limit, 25, 1, 100);
+    const offset = clampGraphQLNumber(args.offset, 0, 0, 5000);
+    const [podcastData, episodeData] = await Promise.all([getPodcast(id), getPodcastEpisodes(id, limit, offset)]);
+    return { ...mapPodcast(podcastData), episodes: (episodeData.data || []).map(mapPodcastEpisode), pagination: { limit, offset, totalNumberOfItems: Number(episodeData.total ?? episodeData.data?.length ?? 0) } };
+  }
+  if (name === "genres") {
+    const data = await getGenres();
+    return (data.data || []).map(g => ({ id: numericId(g.id), name: g.name || "", picture: getPicture(g) }));
+  }
+  if (name === "genreArtists") {
+    const id = requiredGraphQLId(args.id, name);
+    const limit = clampGraphQLNumber(args.limit, 25, 1, 100);
+    const offset = clampGraphQLNumber(args.offset, 0, 0, 5000);
+    const [genreData, artistData] = await Promise.all([getGenre(id), getGenreArtists(id, limit, offset)]);
+    return { id: numericId(genreData.id), name: genreData.name || "", picture: getPicture(genreData), artists: (artistData.data || []).map(mapArtist), pagination: { limit, offset, totalNumberOfItems: Number(artistData.total ?? artistData.data?.length ?? 0) } };
+  }
+  if (name === "radioStations") {
+    const data = await getRadioStations();
+    return (data.data || []).map(r => mapRadioStation(r));
+  }
+  if (name === "radioStation") {
+    const id = requiredGraphQLId(args.id, name);
+    const limit = clampGraphQLNumber(args.limit, 25, 1, 100);
+    const offset = clampGraphQLNumber(args.offset, 0, 0, 5000);
+    const [station, tracks] = await Promise.all([getRadioStation(id), getRadioTracks(id, limit, offset)]);
+    return { ...mapRadioStation(station), tracks: (tracks.data || []).map(mapTrack), pagination: { limit, offset, totalNumberOfItems: Number(tracks.total ?? tracks.data?.length ?? 0) } };
+  }
   if (name === "lyrics") {
     const id = requiredGraphQLId(args.id, name);
     if (!env?.DEEZER_ARL) throw Object.assign(new Error("Set DEEZER_ARL to request account-authorized lyrics from Pipe GraphQL."), { code: "ARL_REQUIRED", status: 503 });
@@ -412,6 +523,58 @@ async function qualityReportFor(id, env, includePreview = false) {
   } catch (_) {
     return { status: "UNKNOWN", predictedQuality: null, formats: [], source: "PIPE_GRAPHQL", mediaUrlGenerated: false, reason: "Quality metadata could not be retrieved." };
   }
+}
+
+function clampGraphQLNumber(value, fallback, min, max) {
+  if (value == null) return fallback;
+  const number = Number(value);
+  if (!Number.isInteger(number) || number < 0) throw Object.assign(new Error("Pagination and limit arguments must be non-negative integers."), { code: "INVALID_ARGUMENT", status: 400 });
+  return Math.max(min, Math.min(max, number));
+}
+function validateGraphQLIdList(values, field, max) {
+  if (!Array.isArray(values) || !values.length || values.length > max) throw Object.assign(new Error(`${field} requires between 1 and ${max} IDs.`), { code: "INVALID_ID_LIST", status: 400 });
+  return values.map(value => requiredGraphQLId(value, field));
+}
+function interleaveUnique(groups) {
+  // Round-robin results so a multi-seed mix does not get dominated by its first seed.
+  const lists = Array.isArray(groups?.[0]) ? groups : [groups];
+  const seen = new Set();
+  const output = [];
+  const maxLength = Math.max(0, ...lists.map(list => Array.isArray(list) ? list.length : 0));
+  for (let index = 0; index < maxLength; index += 1) {
+    for (const list of lists) {
+      const item = list?.[index];
+      if (!item) continue;
+      const id = String(item.id ?? "");
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      output.push(item);
+    }
+  }
+  return output;
+}
+function mapPodcast(item) {
+  return { id: numericId(item?.id), title: item?.title || item?.name || "", description: item?.description || null,
+    available: item?.available ?? true, explicit: Boolean(item?.explicit_content ?? item?.explicit),
+    image: item?.picture_xl || item?.picture_big || item?.picture_medium || item?.picture || null,
+    url: item?.link || (item?.id != null ? `https://www.deezer.com/podcast/${encodeURIComponent(item.id)}` : null) };
+}
+function mapPodcastEpisode(item) {
+  return { id: numericId(item?.id), title: item?.title || "", description: item?.description || null,
+    duration: Number(item?.duration || 0), releaseDate: item?.release_date || null,
+    image: item?.picture_xl || item?.picture_big || item?.picture || null,
+    url: item?.link || (item?.id != null ? `https://www.deezer.com/episode/${encodeURIComponent(item.id)}` : null) };
+}
+function mapRadioStation(item) {
+  return { id: numericId(item?.id), title: item?.title || item?.name || "", description: item?.description || null,
+    picture: item?.picture_xl || item?.picture_big || item?.picture_medium || item?.picture || null,
+    category: item?.genre?.name || item?.category || null };
+}
+function pipeChartSelection(category) {
+  if (category === "TRACK") return `id title duration ISRC isExplicit album { id displayTitle type releaseDate cover { urls(pictureRequest: { width: 500, height: 500 }) } } contributors(first: 5, roles: [MAIN, FEATURED]) { edges { node { ... on Artist { id name } } } }`;
+  if (category === "ALBUM") return `id displayTitle type releaseDate isExplicit cover { urls(pictureRequest: { width: 500, height: 500 }) } contributors(first: 5, roles: [MAIN]) { edges { node { ... on Artist { id name } } } }`;
+  if (category === "ARTIST") return `id name picture { urls(pictureRequest: { width: 500, height: 500 }) } fansCount`;
+  return `id title estimatedTracksCount description picture { urls(pictureRequest: { width: 500, height: 500 }) } owner { id name }`;
 }
 
 function requiredGraphQLId(value, field) {

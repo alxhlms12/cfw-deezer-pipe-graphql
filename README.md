@@ -10,13 +10,16 @@ The service is not a complete implementation of every possible GraphQL-over-HTTP
 
 ## Features
 
-- Catalog search and metadata through typed GraphQL fields: tracks, artists, albums, playlists, mixes, recommendations, artwork, artist relationships, and lyrics.
+- Public catalog search and metadata: tracks, artists, albums, playlists, ISRC lookup, artwork, artist relationships, advanced track metadata, and alternative album editions.
+- Public discovery: similar tracks, round-robin track/artist mixes, batch track lookup, country-chart candidates through Pipe, podcasts, genres, genre artists, radio stations, and radio tracks.
+- Account-data boundary: the GraphQL schema is an explicit allowlist. Personal Flow/configuration (`me { flowConfigs }`), account profiles, favorites, private playlists, listening history, user libraries, and playlist/favorite mutations are not exposed. Flow configuration is deliberately excluded because the Pipe operation is rooted under `me`.
+- SongCatcher: no native Pipe audio-fingerprinting operation has been confirmed, so no fake SongCatcher operation is published. Audio recognition would require a separate recognition integration.
 - Account-specific quality prediction through Deezer Pipe GraphQL when `DEEZER_ARL` is configured.
 - Preview or full-track progressive playback manifests, HLS manifests, and signed media delivery URLs. MPEG-DASH and download usage are recognized by the API but are currently reported as unsupported by the adapter.
 - Optional playback reporting through the `reportPlayback` mutation. Deezer's `log.listen` protocol is undocumented, so an accepted response is not proof of listening-history or royalty credit.
   `reportPlayback` is nullable at the schema level so expected playback-threshold errors remain scoped to that field instead of nulling the entire GraphQL `data` object.
 - Legacy module-specific routes, fields, client helpers, settings, and tests have been removed; the API surface is GraphQL-first.
-- Responses are not cached; `Cache-Control: no-store` is retained for repeatable testing. A per-isolate rate limiter is best-effort; use Cloudflare-level rate limiting for production.
+- The Worker never accepts arbitrary Pipe GraphQL text from clients; every Pipe query is hard-coded server-side. Do not add `me`, favorites, personal Flow, private playlists, or listening-history selections to public resolvers. Responses are not cached; `Cache-Control: no-store` is retained for repeatable testing. A per-isolate rate limiter is best-effort; use Cloudflare-level rate limiting for production.
 
 ## Install and deploy
 
@@ -40,6 +43,15 @@ The service is not a complete implementation of every possible GraphQL-over-HTTP
 6. Run `npm run dev` locally or deploy with `npm run deploy`.
 
 Both secrets are required for authenticated full-track playback. Catalog-only search continues to use Deezer's public REST API without the secrets; if `DEEZER_ARL` is set, eligible catalog lookups use Pipe GraphQL first and fall back to REST if Pipe fails. Pipe and the underlying media service are unofficial/undocumented dependencies and can change without notice.
+
+
+## Public discovery and account-data boundary
+
+The discovery fields are public-catalog wrappers or fixed Pipe queries—not a general-purpose Pipe proxy. `countryCharts` is a candidate against the private Pipe schema and requires a configured `DEEZER_ARL`; validate it against the live upstream schema before depending on it. It uses cursor pagination (`after`) rather than an offset. Track/artist mixes are composed from public Deezer REST track-radio and artist-top responses, so they are not promised to match Deezer's proprietary personalized Mix algorithms. Public REST podcast, genre, and radio routes can change or be region-limited.
+
+Flow is intentionally not exposed: the available Pipe flow-configuration operation is account-rooted (`me { flowConfigs { ... } }`). There is no public `me`, favorites, listening-history, user-library, private-playlist, personal Flow, or account mutation field in this schema. No client-supplied GraphQL is forwarded to Pipe.
+
+SongCatcher is not implemented as a Pipe feature because no native Pipe audio-recognition operation has been confirmed. These changes do not claim to identify an audio recording. That would require a separate fingerprinting provider or a confirmed upstream operation.
 
 ## HTTP transport
 
@@ -107,10 +119,22 @@ Example URL with variables and an operation name, after encoding the `query` and
 | `artist` | `id: ID!` | Artist metadata |
 | `artistCatalog` | `id: ID!`, `skipTracks`, `limit`, `offset` | Artist albums and track catalog |
 | `similarArtists` | `id: ID!`, `limit`, `offset` | Related artists |
+| `similarTracks` | `id: ID!`, `limit`, `offset` | Track-radio recommendations |
+| `trackMix` | `ids: [ID!]!`, `limit`, `offset` | Public multi-seed mix assembled from track-radio catalogs |
+| `artistMix` | `ids: [ID!]!`, `limit`, `offset` | Public multi-artist mix assembled from artist top-track catalogs |
+| `tracksByIds` | `ids: [ID!]!` (up to 100) | Batch public track lookup, preserving input order |
+| `albumEditions` | `id: ID!`, `limit` | Same-title album editions with artist matching |
+| `countryCharts` | `countryCode`, `category`, `limit`, `after` | Country-chart candidate via Pipe cursor pagination; live schema acceptance must be checked against Deezer |
+| `podcastSearch` | `query`, `limit`, `offset` | Public podcast search |
+| `podcast` | `id`, `limit`, `offset` | Public podcast metadata and episodes |
+| `genres` | none | Public genre catalog |
+| `genreArtists` | `id`, `limit`, `offset` | Artists in a public genre |
+| `radioStations` | none | Public radio-station catalog |
+| `radioStation` | `id`, `limit`, `offset` | Public radio metadata and tracks |
 | `lyrics` | `id: ID!`, `type` (`ALL`, `PLAIN`, `LINE`, `WORD`) | Lyrics and available synchronized forms when Deezer returns them for the configured account/region |
 | `reportPlayback` mutation | `trackId: ID!`, `playToken: String!`, `event: PlaybackEvent!` | Best-effort listen-reporting result; `event` is `START` or `THIRTY_SECONDS` |
 
-`SearchType`, `TrackQuality`, `ManifestType`, `ManifestUsage`, `UriScheme`, `LyricsForm`, and `PlaybackEvent` are schema enums. Use enum values without quotes, for example `type: TRACK`, `quality: BEST`, and `type: WORD` for lyrics.
+`SearchType`, `ChartCategory`, `TrackQuality`, `ManifestType`, `ManifestUsage`, `UriScheme`, `LyricsForm`, and `PlaybackEvent` are schema enums. Use enum values without quotes, for example `type: TRACK`, `quality: BEST`, and `type: WORD` for lyrics.
 
 ## More examples
 

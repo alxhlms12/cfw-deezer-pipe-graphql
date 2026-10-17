@@ -33,6 +33,12 @@ const SearchType = new GraphQLEnumType({
   values: enumValues(["TRACK", "SONG", "ARTIST", "ALBUM", "PLAYLIST", "ISRC"]),
 });
 
+const ChartCategory = new GraphQLEnumType({
+  name: "ChartCategory",
+  description: "Public chart catalog category.",
+  values: enumValues(["TRACK", "ALBUM", "ARTIST", "PLAYLIST"]),
+});
+
 const TrackQuality = new GraphQLEnumType({
   name: "TrackQuality",
   description: "A requested or reported audio format/quality.",
@@ -237,6 +243,8 @@ const AlbumSummaryType = new GraphQLObjectType({
     releaseDate: { type: GraphQLString },
     explicit: { type: GraphQLBoolean },
     type: { type: GraphQLString },
+    upc: { type: GraphQLString },
+    label: { type: GraphQLString },
     artists: { type: listOf(ArtistType) },
     artist: { type: ArtistType },
   },
@@ -259,10 +267,15 @@ const TrackType = new GraphQLObjectType({
     version: { type: GraphQLString },
     explicit: { type: GraphQLBoolean },
     isrc: { type: GraphQLString },
+    bpm: { type: GraphQLFloat },
+    gain: { type: GraphQLFloat },
+    rank: { type: GraphQLInt },
+    releaseDate: { type: GraphQLString },
     audioQuality: { type: GraphQLString },
     mediaMetadata: { type: MediaMetadataType },
     artist: { type: ArtistType },
     artists: { type: listOf(ArtistType) },
+    contributors: { type: listOf(ArtistType) },
     album: { type: AlbumSummaryType },
     preview: { type: GraphQLString },
   },
@@ -305,6 +318,8 @@ const SearchResultType = new GraphQLObjectType({
     limit: { type: GraphQLInt },
     offset: { type: GraphQLInt },
     totalNumberOfItems: { type: GraphQLInt },
+    hasNextPage: { type: GraphQLBoolean },
+    nextCursor: { type: GraphQLString },
     items: { type: listOf(SearchItemType) },
   },
 });
@@ -323,6 +338,7 @@ const AlbumType = new GraphQLObjectType({
     explicit: { type: GraphQLBoolean },
     url: { type: GraphQLString },
     copyright: { type: GraphQLString },
+    label: { type: GraphQLString },
     cover: { type: GraphQLString },
     allowStreaming: { type: GraphQLBoolean },
     artist: { type: ArtistType },
@@ -470,6 +486,45 @@ const LyricsType = new GraphQLObjectType({
   },
 });
 
+const PodcastEpisodeType = new GraphQLObjectType({
+  name: "PodcastEpisode",
+  fields: {
+    id: { type: nonNull(GraphQLID) }, title: { type: GraphQLString }, description: { type: GraphQLString },
+    duration: { type: GraphQLInt }, releaseDate: { type: GraphQLString }, image: { type: GraphQLString },
+    url: { type: GraphQLString },
+  },
+});
+const PodcastType = new GraphQLObjectType({
+  name: "Podcast",
+  fields: {
+    id: { type: nonNull(GraphQLID) }, title: { type: GraphQLString }, description: { type: GraphQLString },
+    available: { type: GraphQLBoolean }, explicit: { type: GraphQLBoolean }, image: { type: GraphQLString },
+    url: { type: GraphQLString }, episodes: { type: listOf(PodcastEpisodeType) }, pagination: { type: PaginationType },
+  },
+});
+const PodcastSearchResultType = new GraphQLObjectType({
+  name: "PodcastSearchResult",
+  fields: {
+    query: { type: GraphQLString }, limit: { type: GraphQLInt }, offset: { type: GraphQLInt },
+    totalNumberOfItems: { type: GraphQLInt }, items: { type: listOf(PodcastType) },
+  },
+});
+const GenreType = new GraphQLObjectType({
+  name: "Genre",
+  fields: {
+    id: { type: nonNull(GraphQLID) }, name: { type: GraphQLString }, picture: { type: GraphQLString },
+    artists: { type: listOf(ArtistType) }, pagination: { type: PaginationType },
+  },
+});
+const RadioStationType = new GraphQLObjectType({
+  name: "RadioStation",
+  fields: {
+    id: { type: nonNull(GraphQLID) }, title: { type: GraphQLString }, description: { type: GraphQLString },
+    picture: { type: GraphQLString }, category: { type: GraphQLString }, tracks: { type: listOf(TrackType) },
+    pagination: { type: PaginationType },
+  },
+});
+
 const ApiInfoType = new GraphQLObjectType({
   name: "ApiInfo",
   fields: {
@@ -561,6 +616,39 @@ export function buildGraphQLSchema() {
         id: { type: nonNull(GraphQLID) }, limit: { type: GraphQLInt, default: { value: 25 } }, offset: { type: GraphQLInt, default: { value: 0 } },
       }),
       lyrics: queryField("lyrics", LyricsType, { id: { type: nonNull(GraphQLID) }, type: { type: LyricsForm, default: { value: "ALL" } } }),
+      similarTracks: queryField("similarTracks", nonNull(RecommendationConnectionType), {
+        id: { type: nonNull(GraphQLID) }, limit: { type: GraphQLInt, default: { value: 20 } }, offset: { type: GraphQLInt, default: { value: 0 } },
+      }),
+      trackMix: queryField("trackMix", nonNull(MixType), {
+        ids: { type: nonNull(listOf(nonNull(GraphQLID))) }, limit: { type: GraphQLInt, default: { value: 40 } }, offset: { type: GraphQLInt, default: { value: 0 } },
+      }),
+      artistMix: queryField("artistMix", nonNull(MixType), {
+        ids: { type: nonNull(listOf(nonNull(GraphQLID))) }, limit: { type: GraphQLInt, default: { value: 40 } }, offset: { type: GraphQLInt, default: { value: 0 } },
+      }),
+      tracksByIds: queryField("tracksByIds", nonNull(listOf(TrackType)), {
+        ids: { type: nonNull(listOf(nonNull(GraphQLID))) },
+      }),
+      albumEditions: queryField("albumEditions", nonNull(listOf(AlbumSummaryType)), {
+        id: { type: nonNull(GraphQLID) }, limit: { type: GraphQLInt, default: { value: 25 } },
+      }),
+      countryCharts: queryField("countryCharts", nonNull(SearchResultType), {
+        countryCode: { type: nonNull(GraphQLString) }, category: { type: ChartCategory, default: { value: "TRACK" } },
+        limit: { type: GraphQLInt, default: { value: 25 } }, after: { type: GraphQLString },
+      }),
+      podcastSearch: queryField("podcastSearch", nonNull(PodcastSearchResultType), {
+        query: { type: nonNull(GraphQLString) }, limit: { type: GraphQLInt, default: { value: 25 } }, offset: { type: GraphQLInt, default: { value: 0 } },
+      }),
+      podcast: queryField("podcast", PodcastType, {
+        id: { type: nonNull(GraphQLID) }, limit: { type: GraphQLInt, default: { value: 25 } }, offset: { type: GraphQLInt, default: { value: 0 } },
+      }),
+      genres: queryField("genres", nonNull(listOf(GenreType))),
+      genreArtists: queryField("genreArtists", GenreType, {
+        id: { type: nonNull(GraphQLID) }, limit: { type: GraphQLInt, default: { value: 25 } }, offset: { type: GraphQLInt, default: { value: 0 } },
+      }),
+      radioStations: queryField("radioStations", nonNull(listOf(RadioStationType))),
+      radioStation: queryField("radioStation", RadioStationType, {
+        id: { type: nonNull(GraphQLID) }, limit: { type: GraphQLInt, default: { value: 25 } }, offset: { type: GraphQLInt, default: { value: 0 } },
+      }),
     },
   });
 

@@ -1,7 +1,7 @@
 const REST = "https://api.deezer.com";
 const PIPE = "https://pipe.deezer.com/api";
 const AUTH = "https://auth.deezer.com/login/arl";
-const APP_VERSION = "3.2.5";
+const APP_VERSION = "3.3.1";
 
 let jwt = "";
 let jwtExpiresAt = 0;
@@ -187,6 +187,38 @@ export async function searchRest(type, q, limit, offset) {
   return rest(segment, { q, limit, index: offset });
 }
 
+// Public catalog discovery helpers. These routes never access a user's private library.
+export async function getTracksByIds(ids) {
+  const normalized = [...new Set((ids || []).map(String).filter(id => /^\d+$/.test(id)))].slice(0, 100);
+  return Promise.all(normalized.map(async id => {
+    try { return await getTrack(id); } catch (_) { return null; }
+  }));
+}
+export async function searchPodcasts(q, limit = 25, offset = 0) {
+  return rest("search/podcast", { q, limit, index: offset });
+}
+export async function getPodcast(id) { return rest(`podcast/${encodeURIComponent(String(id))}`); }
+export async function getPodcastEpisodes(id, limit = 25, offset = 0) {
+  return rest(`podcast/${encodeURIComponent(String(id))}/episodes`, { limit, index: offset });
+}
+export async function getGenres() { return rest("genre"); }
+export async function getGenre(id) { return rest(`genre/${encodeURIComponent(String(id))}`); }
+export async function getGenreArtists(id, limit = 25, offset = 0) {
+  return rest(`genre/${encodeURIComponent(String(id))}/artists`, { limit, index: offset });
+}
+export async function getRadioStations() { return rest("radio"); }
+export async function getRadioStation(id) { return rest(`radio/${encodeURIComponent(String(id))}`); }
+export async function getRadioTracks(id, limit = 25, offset = 0) {
+  return rest(`radio/${encodeURIComponent(String(id))}/tracks`, { limit, index: offset });
+}
+export async function getChartCategory(category = "TRACK", limit = 25, offset = 0) {
+  const normalized = String(category).toLowerCase();
+  const allowed = new Set(["tracks", "albums", "artists", "playlists"]);
+  const path = allowed.has(normalized) ? normalized : ({ track: "tracks", album: "albums", artist: "artists", playlist: "playlists" })[normalized];
+  if (!path) throw Object.assign(new Error("category must be TRACK, ALBUM, ARTIST, or PLAYLIST."), { status: 400, code: "INVALID_CHART_CATEGORY" });
+  return rest(`chart/0/${path}`, { limit, index: offset });
+}
+
 export function mapArtist(a) {
   if (!a) return null;
   const picture = a.picture_xl || a.picture_big || a.picture_medium || a.picture || null;
@@ -202,6 +234,9 @@ export function mapAlbumSummary(a) {
     id: numOrString(a.id), title: a.title || a.displayTitle || "", cover: a.cover_xl || a.cover_big || a.cover || null,
     url: a.link || `https://www.deezer.com/album/${a.id}`,
     ...(a.release_date ? { releaseDate: a.release_date } : {}),
+    ...(a.record_type ? { type: String(a.record_type).toUpperCase() } : {}),
+    ...(a.upc ? { upc: String(a.upc) } : {}),
+    ...(a.label ? { label: a.label } : {}),
     ...(typeof a.explicit_lyrics === "boolean" ? { explicit: a.explicit_lyrics } : {}),
   };
 }
@@ -222,8 +257,12 @@ export function mapTrack(t, parentAlbum = null) {
     ...(typeof t.explicit_lyrics === "boolean" ? { explicit: t.explicit_lyrics } : {}),
     ...(t.link ? { url: t.link } : { url: `https://www.deezer.com/track/${t.id}` }),
     ...(t.isrc ? { isrc: t.isrc } : {}),
+    ...(Number.isFinite(Number(t.bpm)) && t.bpm != null ? { bpm: Number(t.bpm) } : {}),
+    ...(Number.isFinite(Number(t.gain)) && t.gain != null ? { gain: Number(t.gain) } : {}),
+    ...(Number.isFinite(Number(t.rank)) && t.rank != null ? { rank: Number(t.rank) } : {}),
+    ...(t.release_date || t.album?.release_date ? { releaseDate: t.release_date || t.album?.release_date } : {}),
     ...(hasPreviewField ? { audioQuality: preview ? "PREVIEW" : "UNAVAILABLE", mediaMetadata: { tags: [preview ? "PREVIEW_ONLY" : "UNAVAILABLE"] } } : {}),
-    ...(artist ? { artist } : {}), ...(artists.length ? { artists } : {}), ...(album ? { album } : {}),
+    ...(artist ? { artist } : {}), ...(artists.length ? { artists, contributors: artists } : {}), ...(album ? { album } : {}),
     ...(preview ? { preview } : {}),
   };
 }
@@ -238,7 +277,7 @@ export function mapAlbum(a) {
     ...(a.upc ? { upc: a.upc } : {}),
     ...(typeof a.explicit_lyrics === "boolean" ? { explicit: a.explicit_lyrics } : {}),
     ...(a.link ? { url: a.link } : { url: `https://www.deezer.com/album/${a.id}` }),
-    ...(a.label ? { copyright: a.label } : {}),
+    ...(a.label ? { copyright: a.label, label: a.label } : {}),
     ...(a.cover_xl || a.cover_big || a.cover ? { cover: a.cover_xl || a.cover_big || a.cover } : {}),
     ...(primaryArtist ? { artist: primaryArtist, artists: [primaryArtist] } : {}),
   };
